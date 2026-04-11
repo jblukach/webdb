@@ -3,13 +3,49 @@ import os
 
 import aws_cdk as cdk
 
+from webdb.webdb_copy import WebdbCopy
+from webdb.webdb_enrich import WebdbEnrich
 from webdb.webdb_github import WebdbGithub
+from webdb.webdb_storage import WebdbStorage
 from webdb.webdb_table import WebdbTable
 
 app = cdk.App()
 
+WebdbCopy(
+    app, 'WebdbCopy',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbEnrich(
+    app, 'WebdbEnrich',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
 WebdbGithub(
     app, 'WebdbGithub',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbStorage(
+    app, 'WebdbStorage',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'
