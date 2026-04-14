@@ -3,24 +3,13 @@ import os
 
 import aws_cdk as cdk
 
-from webdb.webdb_copy import WebdbCopy
 from webdb.webdb_enrich import WebdbEnrich
 from webdb.webdb_github import WebdbGithub
 from webdb.webdb_storage import WebdbStorage
 from webdb.webdb_table import WebdbTable
+from webdb.webdb_transfer import WebdbTransfer
 
 app = cdk.App()
-
-WebdbCopy(
-    app, 'WebdbCopy',
-    env = cdk.Environment(
-        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
-        region = 'us-east-2'
-    ),
-    synthesizer = cdk.DefaultStackSynthesizer(
-        qualifier = 'lukach'
-    )
-)
 
 WebdbEnrich(
     app, 'WebdbEnrich',
@@ -57,6 +46,17 @@ WebdbStorage(
 
 WebdbTable(
     app, 'WebdbTable',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbTransfer(
+    app, 'WebdbTransfer',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'

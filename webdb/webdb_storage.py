@@ -20,7 +20,7 @@ class WebdbStorage(Stack):
                 bucket_name = f"webdb-{region}-{namespace}",
                 encryption = _s3.BucketEncryption.S3_MANAGED,
                 block_public_access = _s3.BlockPublicAccess.BLOCK_ALL,
-                removal_policy = RemovalPolicy.DESTROY,
+                removal_policy = RemovalPolicy.RETAIN,
                 auto_delete_objects = False,
                 enforce_ssl = True,
                 versioned = False
