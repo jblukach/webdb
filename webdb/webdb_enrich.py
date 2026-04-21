@@ -1,3 +1,5 @@
+import datetime
+
 from aws_cdk import (
     Duration,
     RemovalPolicy,
@@ -19,6 +21,53 @@ class WebdbEnrich(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         account = Stack.of(self).account
+
+        year = datetime.datetime.now().strftime('%Y')
+        month = datetime.datetime.now().strftime('%m')
+        day = datetime.datetime.now().strftime('%d')
+
+    ### S3 BUCKET ###
+
+        bucket = _s3.Bucket.from_bucket_name(
+            self, 'bucket',
+            bucket_name = 'packages-use2-lukach-io'
+        )
+
+    ### LAMBDA LAYERS ###
+
+        geoip2 = _lambda.LayerVersion(
+            self, 'geoip2',
+            layer_version_name = 'geoip2',
+            description = str(year)+'-'+str(month)+'-'+str(day)+' deployment',
+            code = _lambda.Code.from_bucket(
+                bucket = bucket,
+                key = 'geoip2.zip'
+            ),
+            compatible_architectures = [
+                _lambda.Architecture.ARM_64
+            ],
+            compatible_runtimes = [
+                _lambda.Runtime.PYTHON_3_13
+            ],
+            removal_policy = RemovalPolicy.DESTROY
+        )
+
+        maxminddb = _lambda.LayerVersion(
+            self, 'maxminddb',
+            layer_version_name = 'maxminddb',
+            description = str(year)+'-'+str(month)+'-'+str(day)+' deployment',
+            code = _lambda.Code.from_bucket(
+                bucket = bucket,
+                key = 'maxminddb.zip'
+            ),
+            compatible_architectures = [
+                _lambda.Architecture.ARM_64
+            ],
+            compatible_runtimes = [
+                _lambda.Runtime.PYTHON_3_13
+            ],
+            removal_policy = RemovalPolicy.DESTROY
+        )
 
     ### IMPORT EXISTING ENRICH BUCKET ###
 
@@ -86,6 +135,7 @@ class WebdbEnrich(Stack):
         role.add_to_policy(
             _iam.PolicyStatement(
                 actions = [
+                    's3:DeleteObject',
                     's3:GetObject',
                     's3:PutObject'
                 ],
@@ -105,7 +155,11 @@ class WebdbEnrich(Stack):
             handler = 'enrich.handler',
             timeout = Duration.seconds(900),
             memory_size = 512,
-            role = role
+            role = role,
+            layers = [
+                geoip2,
+                maxminddb
+            ]
         )
 
         _logs.LogGroup(
