@@ -118,42 +118,60 @@ def _build_record(line, ts, reader):
 def _process_object(s3_client, source_bucket, source_key):
     local_source_path = f'/tmp/{source_key}'
     local_source_dir = os.path.dirname(local_source_path)
-    if local_source_dir:
-        os.makedirs(local_source_dir, exist_ok=True)
-
-    s3_client.download_file(source_bucket, source_key, local_source_path)
-    print(f'Copied s3://{source_bucket}/{source_key} to {local_source_path}')
-
-    s3_client.download_file(MMDB_BUCKET, MMDB_KEY, MMDB_LOCAL_PATH)
-    print(f'Copied s3://{MMDB_BUCKET}/{MMDB_KEY} to {MMDB_LOCAL_PATH}')
-
     filename = os.path.basename(source_key)
     ts = _extract_ts_from_filename(filename)
     output_key = f'{os.path.splitext(source_key)[0]}.jsonl'
     output_filename = os.path.basename(output_key)
     local_output_path = f'/tmp/{output_filename}'
 
-    with geoip2.database.Reader(MMDB_LOCAL_PATH) as reader:
-        with open(local_source_path, 'r', encoding='utf-8') as src, open(
-            local_output_path, 'w', encoding='utf-8'
-        ) as dst:
-            for raw_line in src:
-                if not raw_line.strip():
-                    continue
-                row = _build_record(raw_line, ts, reader)
-                dst.write(json.dumps(row, separators=(',', ':')))
-                dst.write('\n')
+    if local_source_dir:
+        os.makedirs(local_source_dir, exist_ok=True)
 
-    s3_client.upload_file(
-        local_output_path,
-        OUTPUT_BUCKET,
-        output_key,
-        ExtraArgs={'ContentType': 'application/x-ndjson'},
-    )
-    print(f'Uploaded s3://{OUTPUT_BUCKET}/{output_key}')
+    try:
+        s3_client.download_file(source_bucket, source_key, local_source_path)
+        print(f'Copied s3://{source_bucket}/{source_key} to {local_source_path}')
 
-    s3_client.delete_object(Bucket=source_bucket, Key=source_key)
-    print(f'Deleted s3://{source_bucket}/{source_key}')
+        s3_client.download_file(MMDB_BUCKET, MMDB_KEY, MMDB_LOCAL_PATH)
+        print(f'Copied s3://{MMDB_BUCKET}/{MMDB_KEY} to {MMDB_LOCAL_PATH}')
+
+        with geoip2.database.Reader(MMDB_LOCAL_PATH) as reader:
+            with open(local_source_path, 'r', encoding='utf-8') as src, open(
+                local_output_path, 'w', encoding='utf-8'
+            ) as dst:
+                for raw_line in src:
+                    if not raw_line.strip():
+                        continue
+                    row = _build_record(raw_line, ts, reader)
+                    dst.write(json.dumps(row, separators=(',', ':')))
+                    dst.write('\n')
+
+        s3_client.upload_file(
+            local_output_path,
+            OUTPUT_BUCKET,
+            output_key,
+            ExtraArgs={'ContentType': 'application/x-ndjson'},
+        )
+        print(f'Uploaded s3://{OUTPUT_BUCKET}/{output_key}')
+
+        s3_client.delete_object(Bucket=source_bucket, Key=source_key)
+        print(f'Deleted s3://{source_bucket}/{source_key}')
+    finally:
+        for tmp_path in (local_source_path, local_output_path, MMDB_LOCAL_PATH):
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError as exc:
+                print(f'Unable to remove temp file {tmp_path}: {exc}')
+
+        # Best effort cleanup of empty folders created under /tmp for source keys.
+        tmp_root = '/tmp'
+        source_parent = os.path.dirname(local_source_path)
+        while source_parent and source_parent.startswith(tmp_root) and source_parent != tmp_root:
+            try:
+                os.rmdir(source_parent)
+            except OSError:
+                break
+            source_parent = os.path.dirname(source_parent)
 
 
 def handler(event, _context):

@@ -3,6 +3,7 @@ import datetime
 from aws_cdk import (
     Duration,
     RemovalPolicy,
+    Size,
     Stack,
     aws_iam as _iam,
     aws_lambda as _lambda,
@@ -154,7 +155,8 @@ class WebdbEnrich(Stack):
             code = _lambda.Code.from_asset('enrich'),
             handler = 'enrich.handler',
             timeout = Duration.seconds(900),
-            memory_size = 512,
+            ephemeral_storage_size = Size.gibibytes(1),
+            memory_size = 2048,
             role = role,
             layers = [
                 geoip2,
