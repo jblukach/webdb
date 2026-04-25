@@ -1,4 +1,5 @@
 from aws_cdk import (
+    Duration,
     RemovalPolicy,
     Stack,
     aws_s3 as _s3
@@ -13,9 +14,9 @@ class WebdbStorage(Stack):
 
         region = Stack.of(self).region
 
-        for namespace in ['enrich', 'insert', 'archive']:
+        for namespace in ['enrich', 'insert', 'archive', 'temporary']:
 
-            _s3.Bucket(
+            bucket = _s3.Bucket(
                 self, namespace,
                 bucket_name = f"webdb-{region}-{namespace}",
                 encryption = _s3.BucketEncryption.S3_MANAGED,
@@ -25,3 +26,9 @@ class WebdbStorage(Stack):
                 enforce_ssl = True,
                 versioned = False
             )
+
+            if namespace == 'temporary':
+                bucket.add_lifecycle_rule(
+                    expiration = Duration.days(1),
+                    noncurrent_version_expiration = Duration.days(1)
+                )

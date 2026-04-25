@@ -32,6 +32,11 @@ class WebdbInsert(Stack):
             bucket_name = f'webdb-{Stack.of(self).region}-insert'
         )
 
+        temporary_bucket = _s3.Bucket.from_bucket_name(
+            self, 'temporary-bucket',
+            bucket_name = f'webdb-{Stack.of(self).region}-temporary'
+        )
+
     ### QUEUE FOR S3 CREATE EVENTS ###
 
         insert_queue_dlq = _sqs.Queue(
@@ -90,26 +95,55 @@ class WebdbInsert(Stack):
 
         role.add_to_policy(
             _iam.PolicyStatement(
-                actions = ['s3:GetObject'],
-                resources = [f'arn:aws:s3:::{insert_bucket.bucket_name}/*']
+                actions = [
+                    's3:GetObject',
+                    's3:PutObject',
+                    's3:DeleteObject',
+                ],
+                resources = [
+                    f'arn:aws:s3:::{insert_bucket.bucket_name}/*',
+                    f'arn:aws:s3:::{temporary_bucket.bucket_name}/*'
+                ]
+            )
+        )
+
+        role.add_to_policy(
+            _iam.PolicyStatement(
+                actions = ['s3:ListBucket', 's3:GetBucketLocation'],
+                resources = [
+                    f'arn:aws:s3:::{insert_bucket.bucket_name}',
+                    f'arn:aws:s3:::{temporary_bucket.bucket_name}'
+                ]
             )
         )
 
         role.add_to_policy(
             _iam.PolicyStatement(
                 actions = [
-                    's3tables:GetTableBucket',
-                    's3tables:GetNamespace',
-                    's3tables:GetTable',
-                    's3tables:PutTableData',
-                    's3tables:GetTableData',
-                    's3tables:UpdateTableMetadataLocation',
-                    's3tables:GetTableMetadataLocation',
+                    'athena:StartQueryExecution',
+                    'athena:GetQueryExecution',
+                    'athena:GetQueryResults',
+                    'athena:StopQueryExecution',
+                    'athena:GetTableMetadata',
+                    'athena:GetDataCatalog',
+                    'athena:GetWorkGroup',
                 ],
-                resources = [
-                    f'arn:aws:s3tables:{Stack.of(self).region}:{account}:bucket/webdb',
-                    f'arn:aws:s3tables:{Stack.of(self).region}:{account}:bucket/webdb/table/{NAMESPACE}/{TABLE_NAME}'
-                ]
+                resources = ['*']
+            )
+        )
+
+        role.add_to_policy(
+            _iam.PolicyStatement(
+                actions = [
+                    'glue:GetDatabase',
+                    'glue:CreateDatabase',
+                    'glue:GetDatabases',
+                    'glue:GetTable',
+                    'glue:GetTables',
+                    'glue:CreateTable',
+                    'glue:DeleteTable',
+                ],
+                resources = ['*']
             )
         )
 
@@ -122,7 +156,17 @@ class WebdbInsert(Stack):
             timeout = Duration.seconds(900),
             ephemeral_storage_size = Size.gibibytes(1),
             memory_size = 2048,
-            role = role
+            role = role,
+            environment = {
+                'ATHENA_TARGET_CATALOG': 's3tablescatalog/webdb',
+                'ATHENA_STAGING_DATABASE': 'webdb_staging',
+                'ATHENA_WORKGROUP': 'primary',
+                'ATHENA_OUTPUT_LOCATION': f's3://{temporary_bucket.bucket_name}/_athena_results/',
+                'ATHENA_RESULTS_PREFIX': '_athena_results',
+                'ATHENA_STAGING_PREFIX': '_athena_staging',
+                'ATHENA_TIMEOUT_SECONDS': '540',
+                'ATHENA_POLL_SECONDS': '2',
+            }
         )
 
         _logs.LogGroup(
