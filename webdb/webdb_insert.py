@@ -14,9 +14,6 @@ from aws_cdk import (
 
 from constructs import Construct
 
-NAMESPACE = 'webdb'
-TABLE_NAME = 'domains'
-
 
 class WebdbInsert(Stack):
 
@@ -35,6 +32,11 @@ class WebdbInsert(Stack):
         temporary_bucket = _s3.Bucket.from_bucket_name(
             self, 'temporary-bucket',
             bucket_name = f'webdb-{Stack.of(self).region}-temporary'
+        )
+
+        archive_bucket = _s3.Bucket.from_bucket_name(
+            self, 'archive-bucket',
+            bucket_name = f'webdb-{Stack.of(self).region}-archive'
         )
 
     ### QUEUE FOR S3 CREATE EVENTS ###
@@ -102,7 +104,8 @@ class WebdbInsert(Stack):
                 ],
                 resources = [
                     f'arn:aws:s3:::{insert_bucket.bucket_name}/*',
-                    f'arn:aws:s3:::{temporary_bucket.bucket_name}/*'
+                    f'arn:aws:s3:::{temporary_bucket.bucket_name}/*',
+                    f'arn:aws:s3:::{archive_bucket.bucket_name}/*'
                 ]
             )
         )
@@ -112,7 +115,8 @@ class WebdbInsert(Stack):
                 actions = ['s3:ListBucket', 's3:GetBucketLocation'],
                 resources = [
                     f'arn:aws:s3:::{insert_bucket.bucket_name}',
-                    f'arn:aws:s3:::{temporary_bucket.bucket_name}'
+                    f'arn:aws:s3:::{temporary_bucket.bucket_name}',
+                    f'arn:aws:s3:::{archive_bucket.bucket_name}'
                 ]
             )
         )
@@ -147,11 +151,27 @@ class WebdbInsert(Stack):
             )
         )
 
-    ### LAMBDA FUNCTION ###
+        role.add_to_policy(
+            _iam.PolicyStatement(
+                actions = [
+                    's3tables:ListTableBuckets',
+                    's3tables:GetTableBucket',
+                    's3tables:ListNamespaces',
+                    's3tables:ListTables',
+                    's3tables:GetNamespace',
+                    's3tables:GetTable',
+                    's3tables:GetTableMetadataLocation',
+                    's3tables:GetTableData',
+                    's3tables:PutTableData',
+                ],
+                resources = ['*']
+            )
+        )
+
+    ### LAMBDA FUNCTION (DOCKER) ###
 
         insert = _lambda.DockerImageFunction(
             self, 'insert',
-            architecture = _lambda.Architecture.X86_64,
             code = _lambda.DockerImageCode.from_image_asset('insert'),
             timeout = Duration.seconds(900),
             ephemeral_storage_size = Size.gibibytes(1),
@@ -159,9 +179,9 @@ class WebdbInsert(Stack):
             role = role,
             environment = {
                 'ATHENA_TARGET_CATALOG': 's3tablescatalog/webdb',
+                'ATHENA_TARGET_DATABASE': 'webdb',
                 'ATHENA_STAGING_DATABASE': 'webdb_staging',
                 'ATHENA_WORKGROUP': 'primary',
-                'ATHENA_OUTPUT_LOCATION': f's3://{temporary_bucket.bucket_name}/_athena_results/',
                 'ATHENA_RESULTS_PREFIX': '_athena_results',
                 'ATHENA_STAGING_PREFIX': '_athena_staging',
                 'ATHENA_TIMEOUT_SECONDS': '540',

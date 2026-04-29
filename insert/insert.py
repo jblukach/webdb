@@ -1,6 +1,7 @@
+import gzip
 import json
 import os
-import re
+import shutil
 import time
 import urllib.parse
 import uuid
@@ -13,68 +14,75 @@ from botocore.exceptions import BotoCoreError, ClientError
 REGION = os.environ.get('AWS_REGION', 'us-east-2')
 NAMESPACE = 'webdb'
 TABLE_NAME = 'domains'
-ATHENA_CATALOG = os.environ.get('ATHENA_TARGET_CATALOG', 's3tablescatalog/webdb')
+ATHENA_TARGET_CATALOG = os.environ.get('ATHENA_TARGET_CATALOG', 's3tablescatalog/webdb')
+ATHENA_TARGET_DATABASE = os.environ.get('ATHENA_TARGET_DATABASE', 'webdb')
 ATHENA_STAGING_DATABASE = os.environ.get('ATHENA_STAGING_DATABASE', 'webdb_staging')
 ATHENA_WORKGROUP = os.environ.get('ATHENA_WORKGROUP', 'primary')
 ATHENA_RESULTS_PREFIX = os.environ.get('ATHENA_RESULTS_PREFIX', '_athena_results')
 ATHENA_STAGING_PREFIX = os.environ.get('ATHENA_STAGING_PREFIX', '_athena_staging')
-ATHENA_OUTPUT_LOCATION = os.environ.get('ATHENA_OUTPUT_LOCATION', '').strip()
-ATHENA_POLL_SECONDS = int(os.environ.get('ATHENA_POLL_SECONDS', '2'))
 ATHENA_TIMEOUT_SECONDS = int(os.environ.get('ATHENA_TIMEOUT_SECONDS', '540'))
+ATHENA_POLL_SECONDS = int(os.environ.get('ATHENA_POLL_SECONDS', '2'))
+
+TARGET_COLUMNS = [
+    ('dns', 'string'),
+    ('ns', 'string'),
+    ('ip', 'string'),
+    ('co', 'string'),
+    ('web', 'string'),
+    ('eml', 'string'),
+    ('hold', 'string'),
+    ('tel', 'bigint'),
+    ('rank', 'bigint'),
+    ('ts', 'string'),
+    ('id', 'string'),
+    ('sld', 'string'),
+    ('tld', 'string'),
+    ('asn', 'bigint'),
+]
 
 
-def _resolve_target_catalog_and_database(value):
-    if '/' in value:
-        catalog, database = value.split('/', 1)
-        catalog = catalog.strip()
-        database = database.strip()
-        if catalog and database:
-            return catalog, database
-    catalog = value.strip()
-    return (catalog or 'AwsDataCatalog'), NAMESPACE
+def _build_dataframe(path):
+    """Read JSONL and convert to DataFrame with appropriate types."""
+    df = pd.read_json(path, lines=True)
+    if df.empty:
+        return None
 
+    # Convert '-' strings to numeric nulls where appropriate
+    for col in df.columns:
+        if df[col].dtype == object and df[col].eq('-').any():
+            converted = pd.to_numeric(df[col], errors='coerce')
+            if converted.notna().any() or df[col].eq('-').all():
+                df[col] = converted.astype('Int64')
 
-TARGET_CATALOG_NAME, TARGET_DATABASE_NAME = _resolve_target_catalog_and_database(ATHENA_CATALOG)
+    # Serialize list/dict columns to JSON strings
+    for col in df.columns:
+        if df[col].dtype == object:
+            first_valid = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+            if isinstance(first_valid, (list, dict)):
+                df[col] = df[col].apply(
+                    lambda v: json.dumps(v, separators=(',', ':')) if v is not None else None
+                )
+
+    return df
 
 
 def _quote_ident(value):
     return '"' + value.replace('"', '""') + '"'
 
 
-def _quote_literal(value):
-    return "'" + value.replace("'", "''") + "'"
+def _qualified_name(catalog, database, table):
+    return f'{_quote_ident(catalog)}.{_quote_ident(database)}.{_quote_ident(table)}'
 
 
-def _safe_temp_table_name(key):
-    base = os.path.basename(key)
-    normalized = re.sub(r'[^a-zA-Z0-9_]', '_', base).lower()
-    normalized = re.sub(r'_+', '_', normalized).strip('_')
-    if not normalized:
-        normalized = 'insert'
-    return f'tmp_{normalized}_{uuid.uuid4().hex[:8]}'
-
-
-def _pandas_type_to_athena(dtype):
-    kind = dtype.kind
-    if kind in ('i', 'u'):
-        return 'bigint'
-    if kind == 'f':
-        return 'double'
-    if kind == 'b':
-        return 'boolean'
-    if kind == 'M':
-        return 'timestamp'
-    return 'string'
-
-
-def _run_athena_query(athena_client, query, output_location, database=None, catalog='AwsDataCatalog'):
+def _run_athena_query(athena_client, query, output_location, database=None):
+    execution_context_database = database or ATHENA_STAGING_DATABASE
     params = {
         'QueryString': query,
         'WorkGroup': ATHENA_WORKGROUP,
         'ResultConfiguration': {'OutputLocation': output_location},
         'QueryExecutionContext': {
-            'Catalog': catalog,
-            'Database': database or ATHENA_STAGING_DATABASE,
+            'Catalog': 'AwsDataCatalog',
+            'Database': execution_context_database,
         },
     }
     response = athena_client.start_query_execution(**params)
@@ -95,241 +103,163 @@ def _run_athena_query(athena_client, query, output_location, database=None, cata
         time.sleep(ATHENA_POLL_SECONDS)
 
 
-def _query_single_value(athena_client, query, output_location, database=None):
-    query_id = _run_athena_query(athena_client, query, output_location, database=database)
-    result = athena_client.get_query_results(QueryExecutionId=query_id)
-    rows = result.get('ResultSet', {}).get('Rows', [])
-
-    # First row is the header for SELECT queries.
-    if len(rows) < 2:
-        return None
-
-    data = rows[1].get('Data', [])
-    if not data:
-        return None
-
-    return data[0].get('VarCharValue')
+def _create_staging_database(athena_client, output_location):
+    sql = f'CREATE DATABASE IF NOT EXISTS {ATHENA_STAGING_DATABASE}'
+    _run_athena_query(athena_client, sql, output_location)
 
 
-def _query_update_count(athena_client, query_id):
-    execution = athena_client.get_query_execution(QueryExecutionId=query_id)
-    stats = execution.get('QueryExecution', {}).get('Statistics', {})
-    return int(stats.get('DataManifestLocation') and stats.get('EngineExecutionTimeInMillis') and
-               execution['QueryExecution'].get('Status', {}).get('State') == 'SUCCEEDED' or 0)
-
-
-def _query_rows_inserted(athena_client, query_id):
-    """Return inserted row count from Athena DML result set (first data cell)."""
-    try:
-        result = athena_client.get_query_results(QueryExecutionId=query_id)
-        rows = result.get('ResultSet', {}).get('Rows', [])
-        # For DML Athena returns a single row with the affected-row count.
-        for row in rows:
-            for cell in row.get('Data', []):
-                val = cell.get('VarCharValue', '')
-                if val.isdigit():
-                    return int(val)
-    except (BotoCoreError, ClientError):
-        pass
-    return None
-
-
-def _build_dataframe(path):
-    df = pd.read_json(path, lines=True)
-    if df.empty:
-        return None
-    for col in df.columns:
-        if df[col].dtype == object and df[col].eq('-').any():
-            converted = pd.to_numeric(df[col], errors='coerce')
-            if converted.notna().any() or df[col].eq('-').all():
-                df[col] = converted.astype('Int64')
-    # Serialize any remaining list/dict columns to JSON strings so parquet
-    # schema matches the string type declared in the Athena staging table DDL.
-    for col in df.columns:
-        if df[col].dtype == object:
-            first_valid = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
-            if isinstance(first_valid, (list, dict)):
-                df[col] = df[col].apply(
-                    lambda v: json.dumps(v, separators=(',', ':')) if v is not None else None
-                )
-    return df
-
-
-def _target_columns(athena_client):
-    try:
-        metadata = athena_client.get_table_metadata(
-            CatalogName=TARGET_CATALOG_NAME,
-            DatabaseName=TARGET_DATABASE_NAME,
-            TableName=TABLE_NAME,
-        )
-        return metadata['TableMetadata']['Columns']
-    except ClientError as exc:
-        error_code = exc.response.get('Error', {}).get('Code')
-        message = exc.response.get('Error', {}).get('Message', '')
-        if error_code in ('MetadataException', 'EntityNotFoundException'):
-            raise RuntimeError(
-                f'Target table {TARGET_CATALOG_NAME}.{TARGET_DATABASE_NAME}.{TABLE_NAME} was not found. '
-                'Verify the table stack is deployed, the Athena target catalog is configured correctly, '
-                'and the table bucket is integrated with AWS analytics services in this Region.'
-            ) from exc
-        if error_code == 'InvalidRequestException' and 'Cannot find catalog' in message:
-            raise RuntimeError(
-                f'Athena catalog {TARGET_CATALOG_NAME} was not found. '
-                'Set ATHENA_TARGET_CATALOG to the catalog that exposes the domains table in this account '
-                '(for S3 Tables this is typically s3tablescatalog/<table-bucket-name>) and ensure the '
-                'table bucket is integrated with AWS analytics services in this Region.'
-            ) from exc
-        raise
-
-
-def _create_staging_table(athena_client, output_location, staging_location, temp_table, dataframe):
-    columns = []
-    for col in dataframe.columns:
-        athena_type = _pandas_type_to_athena(dataframe[col].dtype)
-        columns.append(f'{_quote_ident(col)} {athena_type}')
-
-    create_sql = f'CREATE DATABASE IF NOT EXISTS {ATHENA_STAGING_DATABASE}'
-    _run_athena_query(athena_client, create_sql, output_location)
-
+def _create_staging_table(athena_client, output_location, temp_table, staging_location):
+    columns = ', '.join(f'{_quote_ident(name)} {col_type}' for name, col_type in TARGET_COLUMNS)
     ddl = f'''
 CREATE EXTERNAL TABLE {ATHENA_STAGING_DATABASE}.{temp_table} (
-    {', '.join(columns)}
+    {columns}
 )
 STORED AS PARQUET
-LOCATION {_quote_literal(staging_location)}
+LOCATION '{staging_location}'
 '''.strip()
     _run_athena_query(athena_client, ddl, output_location)
 
 
-def _insert_from_staging(athena_client, output_location, temp_table, target_columns, source_columns):
-    source_names = set(source_columns)
-    select_exprs = []
-    insert_columns = []
-
-    for target in target_columns:
-        name = target['Name']
-        target_type = target['Type']
-        insert_columns.append(_quote_ident(name))
-        if name in source_names:
-            select_exprs.append(
-                f'CAST({_quote_ident(name)} AS {target_type}) AS {_quote_ident(name)}'
-            )
-        else:
-            select_exprs.append(
-                f'CAST(NULL AS {target_type}) AS {_quote_ident(name)}'
-            )
-
+def _insert_from_staging(athena_client, output_location, temp_table):
+    target_name = _qualified_name(ATHENA_TARGET_CATALOG, ATHENA_TARGET_DATABASE, TABLE_NAME)
+    staging_name = _qualified_name('AwsDataCatalog', ATHENA_STAGING_DATABASE, temp_table)
+    col_list = ', '.join(_quote_ident(name) for name, _ in TARGET_COLUMNS)
     insert_sql = f'''
-INSERT INTO {TARGET_CATALOG_NAME}.{TARGET_DATABASE_NAME}.{TABLE_NAME}
-({', '.join(insert_columns)})
-SELECT {', '.join(select_exprs)}
-FROM AwsDataCatalog.{ATHENA_STAGING_DATABASE}.{temp_table}
+INSERT INTO {target_name} ({col_list})
+SELECT {col_list}
+FROM {staging_name}
 '''.strip()
-    query_id = _run_athena_query(
-        athena_client,
-        insert_sql,
-        output_location,
-        database=TARGET_DATABASE_NAME,
-        catalog=TARGET_CATALOG_NAME,
-    )
-    rows = _query_rows_inserted(athena_client, query_id)
-    return rows
+    _run_athena_query(athena_client, insert_sql, output_location, database=ATHENA_STAGING_DATABASE)
 
 
 def _drop_staging_table(athena_client, output_location, temp_table):
-    drop_sql = f'DROP TABLE IF EXISTS {ATHENA_STAGING_DATABASE}.{temp_table}'
-    _run_athena_query(athena_client, drop_sql, output_location)
+    _run_athena_query(
+        athena_client,
+        f'DROP TABLE IF EXISTS {ATHENA_STAGING_DATABASE}.{temp_table}',
+        output_location,
+    )
 
 
-def _insert_file(bucket, key, s3_client, athena_client):
+def _upload_parquet_to_staging(s3_client, parquet_path, staging_bucket, staging_key):
+    s3_client.upload_file(parquet_path, staging_bucket, staging_key)
+
+
+def _archive_and_delete(s3_client, bucket, key, local_path):
+    """Gzip, archive, and delete the source JSONL file."""
+    archive_bucket = f'webdb-{REGION}-archive'
+    basename = os.path.basename(key)
+    stem = os.path.splitext(basename)[0]
+
+    date_prefix = ''
+    if (
+        len(stem) >= 10
+        and stem[4] == '-'
+        and stem[7] == '-'
+        and stem[:4].isdigit()
+        and stem[5:7].isdigit()
+        and stem[8:10].isdigit()
+    ):
+        year, month, day = stem[:4], stem[5:7], stem[8:10]
+        date_prefix = f'{year}/{month}/{day}/'
+
+    gz_local = local_path + '.gz'
+    try:
+        with open(local_path, 'rb') as f_in, gzip.open(gz_local, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+        archive_key = f'{date_prefix}{basename}.gz'
+        s3_client.upload_file(gz_local, archive_bucket, archive_key)
+        print(f'Archived s3://{bucket}/{key} to s3://{archive_bucket}/{archive_key}')
+
+        s3_client.delete_object(Bucket=bucket, Key=key)
+        print(f'Deleted s3://{bucket}/{key}')
+    finally:
+        if os.path.exists(gz_local):
+            os.remove(gz_local)
+
+
+def _insert_file(bucket, key, s3_client, athena_client, request_id):
+    """Process one JSONL file: convert to Parquet, stage in S3, and commit via Athena."""
     local_path = f'/tmp/{os.path.basename(key)}'
     parquet_path = f'/tmp/{uuid.uuid4().hex}.parquet'
-    temp_table = _safe_temp_table_name(key)
     temporary_bucket = f'webdb-{REGION}-temporary'
-    output_location = ATHENA_OUTPUT_LOCATION or f's3://{temporary_bucket}/{ATHENA_RESULTS_PREFIX}/'
-    staging_location = f's3://{temporary_bucket}/{ATHENA_STAGING_PREFIX}/{temp_table}/'
-    parquet_key = f'{ATHENA_STAGING_PREFIX}/{temp_table}/data.parquet'
+    output_location = f's3://{temporary_bucket}/{ATHENA_RESULTS_PREFIX}/'
+    temp_table = f'tmp_{uuid.uuid4().hex[:12]}'
+    staging_prefix = f'{ATHENA_STAGING_PREFIX}/{temp_table}'
+    staging_key = f'{staging_prefix}/data.parquet'
+    staging_location = f's3://{temporary_bucket}/{staging_prefix}/'
 
     try:
         try:
-            s3_client.download_file(bucket, key, local_path)
+            s3_client.head_object(Bucket=bucket, Key=key)
         except ClientError as exc:
-            if exc.response.get('Error', {}).get('Code') == 'NoSuchKey':
+            if exc.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey', 'NotFound'):
                 print(f'Skipping {key}: object no longer exists in {bucket}')
                 return
             raise
+
+        s3_client.download_file(bucket, key, local_path)
+
         dataframe = _build_dataframe(local_path)
         if dataframe is None:
             print(f'No records in {key}')
             return
 
         dataframe.to_parquet(parquet_path, index=False)
-        s3_client.upload_file(parquet_path, temporary_bucket, parquet_key)
 
-        target_columns = _target_columns(athena_client)
-        if not target_columns:
-            raise RuntimeError(
-                f'Target table {TARGET_CATALOG_NAME}.{TARGET_DATABASE_NAME}.{TABLE_NAME} has no schema. '
-                'Provision the table schema before ingesting data.'
-            )
+        _upload_parquet_to_staging(s3_client, parquet_path, temporary_bucket, staging_key)
+        _create_staging_database(athena_client, output_location)
+        _create_staging_table(athena_client, output_location, temp_table, staging_location)
+        _insert_from_staging(athena_client, output_location, temp_table)
 
-        _create_staging_table(
-            athena_client=athena_client,
-            output_location=output_location,
-            staging_location=staging_location,
-            temp_table=temp_table,
-            dataframe=dataframe,
-        )
+        _archive_and_delete(s3_client, bucket, key, local_path)
 
-        staging_count_value = _query_single_value(
-            athena_client,
-            (
-                f'SELECT COUNT(*) '
-                f'FROM AwsDataCatalog.{ATHENA_STAGING_DATABASE}.{temp_table}'
-            ),
-            output_location,
-            database=ATHENA_STAGING_DATABASE,
-        )
-        staging_count = int(staging_count_value or 0)
-
-        inserted_count = _insert_from_staging(
-            athena_client=athena_client,
-            output_location=output_location,
-            temp_table=temp_table,
-            target_columns=target_columns,
-            source_columns=dataframe.columns,
-        )
-
-        if staging_count > 0 and inserted_count is not None and inserted_count == 0:
-            raise RuntimeError(
-                f'Athena insert reported 0 inserted rows for {key} '
-                f'with {staging_count} staging rows in {temp_table}'
-            )
-
-        print(
-            f'Inserted {inserted_count if inserted_count is not None else "?"} records from {key} via Athena '
-            f'(staging rows: {staging_count})'
-        )
+        print(f'Committed {len(dataframe)} staged records from {key} into {NAMESPACE}.{TABLE_NAME}')
+    except Exception as exc:
+        log = {
+            'message': 'insert_file_failed',
+            'request_id': request_id,
+            'bucket': bucket,
+            'key': key,
+            'error_type': type(exc).__name__,
+            'error': str(exc),
+        }
+        print(json.dumps(log, separators=(',', ':')))
+        raise
     finally:
         try:
             _drop_staging_table(athena_client, output_location, temp_table)
         except (RuntimeError, TimeoutError, BotoCoreError, ClientError) as exc:
             print(f'Failed to drop staging table {temp_table}: {exc}')
-
         try:
-            s3_client.delete_object(Bucket=temporary_bucket, Key=parquet_key)
+            s3_client.delete_object(Bucket=temporary_bucket, Key=staging_key)
         except (BotoCoreError, ClientError) as exc:
-            print(f'Failed to delete staging object {parquet_key}: {exc}')
-
+            print(f'Failed to delete staged parquet s3://{temporary_bucket}/{staging_key}: {exc}')
         if os.path.exists(local_path):
             os.remove(local_path)
         if os.path.exists(parquet_path):
             os.remove(parquet_path)
 
 
-def handler(event, _context):
+def handler(event, context):
     s3_client = boto3.client('s3')
     athena_client = boto3.client('athena')
+    request_id = getattr(context, 'aws_request_id', 'unknown')
+
+    print(
+        json.dumps(
+            {
+                'message': 'insert_handler_start',
+                'athena_target_catalog': ATHENA_TARGET_CATALOG,
+                'athena_target_database': ATHENA_TARGET_DATABASE,
+                'namespace': NAMESPACE,
+                'table': TABLE_NAME,
+                'region': REGION,
+                'request_id': request_id,
+            },
+            separators=(',', ':'),
+        )
+    )
 
     for record in event.get('Records', []):
         body = record.get('body', '{}')
@@ -353,6 +283,6 @@ def handler(event, _context):
             print(f'bucket={bucket} key={key}')
 
             if bucket and key:
-                _insert_file(bucket, key, s3_client, athena_client)
+                _insert_file(bucket, key, s3_client, athena_client, request_id)
 
     return {'statusCode': 200}

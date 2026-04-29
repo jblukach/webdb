@@ -60,7 +60,7 @@ class WebdbTransfer(Stack):
             role = role
         )
 
-        logs = _logs.LogGroup(
+        _logs.LogGroup(
             self, 'logs',
             log_group_name = '/aws/lambda/'+transfer.function_name,
             retention = _logs.RetentionDays.ONE_WEEK,
