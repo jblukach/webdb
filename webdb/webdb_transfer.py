@@ -1,6 +1,7 @@
 from aws_cdk import (
     Duration,
     RemovalPolicy,
+    Size,
     Stack,
     aws_events as _events,
     aws_events_targets as _targets,
@@ -56,6 +57,7 @@ class WebdbTransfer(Stack):
                 PUT_BUCKET = 'webdb-us-east-2-enrich'
             ),
             timeout = Duration.seconds(900),
+            ephemeral_storage_size = Size.gibibytes(1),
             memory_size = 512,
             role = role
         )

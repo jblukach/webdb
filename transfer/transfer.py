@@ -4,6 +4,16 @@ import json
 import os
 
 def handler(event, context):
+    print(
+        json.dumps(
+            {
+                'message': 'transfer_handler_start',
+                'request_id': getattr(context, 'aws_request_id', 'unknown'),
+                'record_count': len(event.get('Records', [])) if isinstance(event, dict) else 0,
+            },
+            separators=(',', ':'),
+        )
+    )
 
     year = datetime.datetime.now().strftime('%Y')
     month = datetime.datetime.now().strftime('%m')
@@ -26,11 +36,9 @@ def handler(event, context):
         os.environ['PUT_BUCKET'],
         fname,
         ExtraArgs = {
-            'ContentType': "text/csv"
+            'ContentType': 'text/csv'
         }
     )
-
-    os.system('ls -lh /tmp')
 
     return {
         'statusCode': 200,
