@@ -10,20 +10,18 @@
 | `WebdbTable` | S3 Tables bucket, namespace, and Iceberg table (`webdb.domains`) |
 | `WebdbTransfer` | Scheduled Lambda that copies source data into the enrich bucket |
 | `WebdbEnrich` | Event-driven Lambda that enriches domain records with GeoIP data |
-| `WebdbInsert` | Event-driven Docker Lambda that ingests JSONL into the Iceberg table |
+| `WebdbInsert` | Event-driven Lambda that ingests JSONL into the Iceberg table |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
 
 ## Insert Pipeline
 
-JSONL files uploaded to `webdb-us-east-2-insert` are processed by an SQS-triggered Docker Lambda:
+JSONL files uploaded to `webdb-us-east-2-insert` are processed by an SQS-triggered Lambda:
 
-1. Downloads JSONL from insert bucket
-2. Converts to DataFrame — coerces `'-'` strings to null, serializes nested objects to JSON strings
-3. Writes Parquet to ephemeral storage (`/tmp`)
-4. Fetches table location via S3 Tables SDK (`s3tables:GetTable`)
-5. Uploads Parquet directly to `{tableLocation}/data/`
-6. Gzips and archives source file to `webdb-us-east-2-archive/{YYYY/MM/DD/}`
-7. Deletes original JSONL
+1. Starts an AWS Glue Spark job for each created object
+2. Glue job reads JSONL from the insert bucket and writes into `webdb.domains`
+3. Lambda waits for job completion (so SQS retries still work on failures)
+4. On success, Lambda gzips and archives the source file to `webdb-us-east-2-archive/{YYYY/MM/DD/}`
+5. Lambda deletes the original JSONL object from the insert bucket
 
 ## Table Schema
 
@@ -50,7 +48,6 @@ JSONL files uploaded to `webdb-us-east-2-insert` are processed by an SQS-trigger
 
 - Python 3.12+
 - AWS CDK v2
-- Docker (for building the insert Lambda image)
 - AWS credentials configured with a `db` profile
 
 ```bash
@@ -71,6 +68,6 @@ cdk diff --profile db --all
 
 - [app.py](app.py) — CDK app entry point
 - [webdb/](webdb/) — CDK stack definitions
-- [insert/](insert/) — Docker Lambda handler, Dockerfile, requirements
+- [insert/](insert/) — insert Lambda handler and Glue job script
 - [enrich/](enrich/) — enrichment Lambda handler
 - [transfer/](transfer/) — transfer Lambda handler
