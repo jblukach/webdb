@@ -123,10 +123,13 @@ class WebdbStorage(Stack):
             self, 'webdb-athena-domains-sample-query',
             database = 'webdb',
             name = 'domains_latest_100',
-            description = 'Quick sample query for domains table',
+            description = 'Partition-pruned sample query for latest 100 rows from today',
             query_string = (
                 'SELECT dns, ip, rank, ts, asn '\
                 'FROM webdb.domains '\
+                "WHERE year = CAST(date_format(current_date, '%Y') AS integer) "\
+                "AND month = CAST(date_format(current_date, '%m') AS integer) "\
+                "AND day = CAST(date_format(current_date, '%d') AS integer) "\
                 'ORDER BY ts DESC '\
                 'LIMIT 100'
             ),

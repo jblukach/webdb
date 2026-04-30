@@ -12,6 +12,8 @@ import pyarrow.parquet as pq
 
 DATABASE_BUCKET = os.environ['DATABASE_BUCKET']
 ARCHIVE_BUCKET = os.environ['ARCHIVE_BUCKET']
+PARQUET_COMPRESSION = 'zstd'
+PARQUET_TARGET_ROW_GROUP_SIZE = 100000
 
 
 SCHEMA = pa.schema(
@@ -126,7 +128,15 @@ def _convert_object(s3_client, source_bucket, source_key):
     parquet_key = f'year={year}/month={month}/day={day}/{parquet_stem}.parquet'
     local_parquet_path = f'/tmp/{parquet_stem}.parquet'
 
-    pq.write_table(table, local_parquet_path, compression = 'snappy')
+    row_group_size = min(len(records), PARQUET_TARGET_ROW_GROUP_SIZE)
+    pq.write_table(
+        table,
+        local_parquet_path,
+        compression = PARQUET_COMPRESSION,
+        use_dictionary = True,
+        write_statistics = True,
+        row_group_size = row_group_size
+    )
 
     s3_client.upload_file(
         local_parquet_path,
