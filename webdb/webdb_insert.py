@@ -84,7 +84,7 @@ class WebdbInsert(Stack):
             architecture = _lambda.Architecture.X86_64,
             timeout = Duration.seconds(900),
             memory_size = 4096,
-            ephemeral_storage_size = Size.gibibytes(1),
+            ephemeral_storage_size = Size.gibibytes(2),
             environment = {
                 'DATABASE_BUCKET': database_bucket.bucket_name,
                 'ARCHIVE_BUCKET': archive_bucket.bucket_name
