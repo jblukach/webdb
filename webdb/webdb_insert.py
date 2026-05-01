@@ -83,7 +83,7 @@ class WebdbInsert(Stack):
             code = _lambda.DockerImageCode.from_image_asset('insert'),
             architecture = _lambda.Architecture.X86_64,
             timeout = Duration.seconds(900),
-            memory_size = 2048,
+            memory_size = 4096,
             ephemeral_storage_size = Size.gibibytes(1),
             environment = {
                 'DATABASE_BUCKET': database_bucket.bucket_name,
