@@ -10,6 +10,7 @@
 | `WebdbTransfer` | Scheduled Lambda that copies source data into the enrich bucket |
 | `WebdbEnrich` | Event-driven Lambda that enriches domain records with GeoIP data |
 | `WebdbInsert` | S3/SQS-triggered Docker Lambda that converts JSONL to Parquet, writes database data, and archives gzip JSONL |
+| `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations from shared DynamoDB and runs Athena UNLOAD of unique domain matches |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
 
 ## Table Schema
@@ -89,6 +90,27 @@ Current object key layout:
 
 - Database Parquet: `year=YYYY/month=MM/day=DD/<source-stem>.parquet`
 - Archive gzip JSONL: `year=YYYY/month=MM/day=DD/<source-filename>.gz`
+
+## Search Pipeline Behavior
+
+`WebdbSearch` is invoked by WebMonitor with a payload containing `Item` (the SLD).
+
+Lookup behavior:
+
+1. Reads permutations from DynamoDB table `permutation` in the lunker account.
+2. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>`.
+3. Reads the `perm` attribute and normalizes/de-duplicates values.
+
+Query behavior:
+
+1. Builds a term list from the SLD plus all permutations.
+2. Expands terms into Athena `LIKE` clauses joined by `OR`, using `lower(dns) LIKE '%term%' ESCAPE '#'`.
+3. Runs Athena `UNLOAD` of distinct `dns` values.
+
+Output behavior:
+
+1. Writes compressed text output to the output bucket.
+2. Prefix format is timestamped to avoid target directory collisions: `<sld>/YYYY-MM-DD-HH-MM/`.
 
 ## Repository Layout
 

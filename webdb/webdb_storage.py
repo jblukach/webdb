@@ -16,7 +16,7 @@ class WebdbStorage(Stack):
 
         region = Stack.of(self).region
 
-        for namespace in ['database', 'enrich', 'insert', 'archive', 'temporary']:
+        for namespace in ['database', 'enrich', 'insert', 'archive', 'temporary', 'output']:
 
             bucket = _s3.Bucket(
                 self, namespace,
@@ -29,7 +29,7 @@ class WebdbStorage(Stack):
                 versioned = False
             )
 
-            if namespace == 'temporary':
+            if namespace in ('temporary', 'output'):
                 bucket.add_lifecycle_rule(
                     expiration = Duration.days(1),
                     noncurrent_version_expiration = Duration.days(1)

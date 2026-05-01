@@ -6,6 +6,7 @@ import aws_cdk as cdk
 from webdb.webdb_enrich import WebdbEnrich
 from webdb.webdb_github import WebdbGithub
 from webdb.webdb_insert import WebdbInsert
+from webdb.webdb_search import WebdbSearch
 from webdb.webdb_storage import WebdbStorage
 from webdb.webdb_transfer import WebdbTransfer
 
@@ -57,6 +58,17 @@ WebdbTransfer(
 
 WebdbInsert(
     app, 'WebdbInsert',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbSearch(
+    app, 'WebdbSearch',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'
