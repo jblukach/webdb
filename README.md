@@ -91,6 +91,18 @@ Current object key layout:
 - Database Parquet: `year=YYYY/month=MM/day=DD/<source-stem>.parquet`
 - Archive gzip JSONL: `year=YYYY/month=MM/day=DD/<source-filename>.gz`
 
+## Splitting Large Source Files
+
+If a source export is too large to handle comfortably as a single object, split it into smaller chunks before loading it into the webdb data lake. This makes uploads and downstream processing easier to manage.
+
+Example: split a large CSV into 1,000,000-line chunks with a date-stamped prefix:
+
+```bash
+split -l 1000000 domains-detailed.csv 2026-05-01-domains-detailed-
+```
+
+This produces files such as `2026-05-01-domains-detailed-aa`, `2026-05-01-domains-detailed-ab`, and so on, which can then be uploaded or processed in smaller batches.
+
 ## Search Pipeline Behavior
 
 `WebdbSearch` is invoked by WebMonitor with a payload containing `Item` (the SLD).
