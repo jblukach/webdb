@@ -98,8 +98,9 @@ Current object key layout:
 Lookup behavior:
 
 1. Reads permutations from DynamoDB table `permutation` in the lunker account.
-2. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>`.
-3. Reads the `perm` attribute and normalizes/de-duplicates values.
+2. Requires `DYNAMODB_TABLE` to be set (recommended: full table ARN for cross-account access).
+3. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>`.
+4. Reads the `perm` attribute and normalizes/de-duplicates values.
 
 Query behavior:
 
@@ -110,7 +111,7 @@ Query behavior:
 Output behavior:
 
 1. Writes compressed text output to the output bucket.
-2. Prefix format is timestamped to avoid target directory collisions: `<sld>/YYYY-MM-DD-HH-MM/`.
+2. Prefix format is timestamped to avoid target directory collisions: `<sld>/YYYY-MM-DD-HH-MM-SS/`.
 
 ## Repository Layout
 

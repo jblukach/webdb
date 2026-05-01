@@ -81,15 +81,6 @@ def _build_table_identifiers(perm_table_env):
     if perm_table_env:
         table_identifiers.append(perm_table_env)
 
-        # Cross-account DynamoDB access should use the full table ARN.
-        if perm_table_env.startswith('arn:'):
-            table_name = perm_table_env.split('/')[-1]
-            if table_name and table_name not in table_identifiers:
-                table_identifiers.append(table_name)
-
-    if 'permutation' not in table_identifiers:
-        table_identifiers.append('permutation')
-
     # Preserve order but de-duplicate.
     unique_identifiers = []
     for identifier in table_identifiers:
@@ -158,7 +149,6 @@ def handler(event, _context):
     print(event)
 
     item = event.get('Item')
-    item = 'lukach'
     if not item:
         return {
             'statusCode': 400,
@@ -166,7 +156,12 @@ def handler(event, _context):
         }
 
     region_candidates = []
-    perm_table_env = os.environ.get('DYNAMODB_TABLE', 'permutation').strip()
+    perm_table_env = os.environ.get('DYNAMODB_TABLE', '').strip()
+    if not perm_table_env:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': 'Missing DYNAMODB_TABLE environment variable'})
+        }
 
     if perm_table_env.startswith('arn:'):
         arn_parts = perm_table_env.split(':')
@@ -201,7 +196,7 @@ def handler(event, _context):
     print('WHERE clause terms: ' + str(len(like_clauses)))
 
     now = datetime.datetime.now()
-    date_stem = now.strftime('%Y-%m-%d-%H-%M')
+    date_stem = now.strftime('%Y-%m-%d-%H-%M-%S')
 
     output_prefix = _safe_path_value(normalized_item) + '/' + date_stem + '/'
 
