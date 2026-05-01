@@ -6,11 +6,13 @@
 
 | Stack | Description |
 | --- | --- |
+| `WebdbDatabase` | DynamoDB table infrastructure, including the shared `possibilities` table for cross-account access from lunker |
 | `WebdbStorage` | S3 buckets, Glue database/table, and Athena workgroup/query resources |
 | `WebdbTransfer` | Scheduled Lambda that copies source data into the enrich bucket |
 | `WebdbEnrich` | Event-driven Lambda that enriches domain records with GeoIP data |
 | `WebdbInsert` | S3/SQS-triggered Docker Lambda that converts JSONL to Parquet, writes database data, and archives gzip JSONL |
 | `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations from shared DynamoDB and runs Athena UNLOAD of unique domain matches |
+| `WebdbOutput` | S3/SQS-triggered Lambda that ingests gzip output files and batch-writes discovered domains into DynamoDB |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
 
 ## Table Schema
@@ -33,6 +35,30 @@
 | `sld` | string |
 | `tld` | string |
 | `asn` | bigint |
+
+## DynamoDB
+
+`WebdbDatabase` creates the `possibilities` DynamoDB table in `us-east-2` with the following shape:
+
+| Attribute | Purpose |
+| --- | --- |
+| `pk` | partition key |
+| `sk` | sort key |
+
+`WebdbOutput` writes items with this layout:
+
+| Attribute | Value |
+| --- | --- |
+| `pk` | `LUNKER#` |
+| `sk` | `LUNKER#<search>#<domain>` |
+| `domain` | fully qualified domain name |
+| `search` | first folder from the S3 object key |
+| `sld` | second-level domain |
+| `tbl` | `possibilities` |
+| `tld` | top-level domain |
+| `ttl` | Unix epoch expiration set to 30 days |
+
+The table uses on-demand billing, point-in-time recovery, and deletion protection. A DynamoDB resource policy grants the lunker account access to `DescribeTable`, `GetItem`, and `Query`.
 
 ## Prerequisites
 
@@ -125,10 +151,29 @@ Output behavior:
 1. Writes compressed text output to the output bucket.
 2. Prefix format is timestamped to avoid target directory collisions: `<sld>/YYYY-MM-DD-HH-MM-SS/`.
 
+## Output Pipeline Behavior
+
+`WebdbOutput` ingests `.gz` objects from the output bucket and performs these actions:
+
+1. S3 `OBJECT_CREATED` events are delivered to an SQS queue.
+2. The main queue uses a dead-letter queue after 5 failed receives.
+3. The output Lambda downloads each gzip file to `/tmp`.
+4. The Lambda decompresses the file and processes one domain per line.
+5. Domains are batch-written into DynamoDB table `possibilities`.
+6. The local `/tmp` file is deleted after processing.
+
+Current runtime configuration:
+
+- Lambda memory: `1024 MB`
+- Lambda ephemeral storage: `1 GiB`
+- SQS batch size: `10`
+- DynamoDB batch write size: `25`
+
 ## Repository Layout
 
 - [app.py](app.py) — CDK app entry point
 - [webdb/](webdb/) — CDK stack definitions
 - [enrich/](enrich/) — enrichment Lambda handler
 - [insert/](insert/) — Docker Lambda for JSONL to Parquet conversion
+- [output/](output/) — Lambda for gzip output ingestion into DynamoDB
 - [transfer/](transfer/) — transfer Lambda handler

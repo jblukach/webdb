@@ -3,14 +3,27 @@ import os
 
 import aws_cdk as cdk
 
+from webdb.webdb_database import WebdbDatabase
 from webdb.webdb_enrich import WebdbEnrich
 from webdb.webdb_github import WebdbGithub
 from webdb.webdb_insert import WebdbInsert
+from webdb.webdb_output import WebdbOutput
 from webdb.webdb_search import WebdbSearch
 from webdb.webdb_storage import WebdbStorage
 from webdb.webdb_transfer import WebdbTransfer
 
 app = cdk.App()
+
+WebdbDatabase(
+    app, 'WebdbDatabase',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
 
 WebdbEnrich(
     app, 'WebdbEnrich',
@@ -69,6 +82,17 @@ WebdbInsert(
 
 WebdbSearch(
     app, 'WebdbSearch',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbOutput(
+    app, 'WebdbOutput',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'
