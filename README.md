@@ -143,8 +143,9 @@ Lookup behavior:
 Query behavior:
 
 1. Builds a term list from the SLD plus all permutations.
-2. Expands terms into Athena `LIKE` clauses joined by `OR`, using `lower(dns) LIKE '%term%' ESCAPE '#'`.
-3. Runs Athena `UNLOAD` of distinct `dns` values.
+2. For SLDs shorter than 5 characters, queries Athena with `lower(sld) IN (...)` using the SLD plus all permutations.
+3. For longer SLDs, expands terms into Athena `LIKE` clauses joined by `OR`, using `lower(dns) LIKE '%term%' ESCAPE '#'`.
+4. Runs Athena `UNLOAD` of distinct `dns` values.
 
 Output behavior:
 

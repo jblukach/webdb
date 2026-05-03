@@ -33,6 +33,18 @@ def _sql_like_string(value):
     return _sql_string(value).replace('#', '##').replace('%', '#%').replace('_', '#_')
 
 
+def _build_where_clause(terms, exact_sld_match=False):
+    if exact_sld_match:
+        return 'lower(sld) IN (' + ', '.join("'" + _sql_string(term) + "'" for term in terms) + ')'
+
+    like_clauses = []
+    for term in terms:
+        like_term = _sql_like_string(term)
+        like_clauses.append("lower(dns) LIKE '%" + like_term + "%' ESCAPE '#'")
+
+    return ' OR '.join(like_clauses)
+
+
 def _build_search_terms(item, permutations):
     terms = []
 
@@ -187,13 +199,10 @@ def handler(event, _context):
             'body': json.dumps({'message': 'No search terms'})
         }
 
-    like_clauses = []
-    for term in terms:
-        like_term = _sql_like_string(term)
-        like_clauses.append("lower(dns) LIKE '%" + like_term + "%' ESCAPE '#'")
-
-    where_clause = ' OR '.join(like_clauses)
-    print('WHERE clause terms: ' + str(len(like_clauses)))
+    exact_sld_match = len(normalized_item) < 5
+    where_clause = _build_where_clause(terms, exact_sld_match=exact_sld_match)
+    print('WHERE clause terms: ' + str(len(terms)))
+    print('WHERE clause mode: ' + ('lower(sld) exact match' if exact_sld_match else 'lower(dns) LIKE'))
 
     now = datetime.datetime.now()
     date_stem = now.strftime('%Y-%m-%d-%H-%M-%S')
