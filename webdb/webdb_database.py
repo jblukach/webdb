@@ -84,3 +84,23 @@ class WebdbDatabase(Stack):
                 ),
             ],
         )
+
+        _dynamodb.TableV2(
+            self, 'state',
+            table_name = 'state',
+            partition_key = {
+                'name': 'pk',
+                'type': _dynamodb.AttributeType.STRING
+            },
+            sort_key = {
+                'name': 'sk',
+                'type': _dynamodb.AttributeType.STRING
+            },
+            billing = _dynamodb.Billing.on_demand(),
+            removal_policy = RemovalPolicy.DESTROY,
+            point_in_time_recovery_specification = _dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled = True
+            ),
+            deletion_protection = True,
+            time_to_live_attribute = 'ttl',
+        )

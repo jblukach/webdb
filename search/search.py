@@ -11,6 +11,8 @@ from botocore.exceptions import ClientError
 _ATHENA = boto3.client('athena')
 _DYNAMODB_CLIENTS = {}
 _DESERIALIZER = TypeDeserializer()
+_STATE_PK = 'LUNKER#'
+_STATE_TTL_DAYS = 36
 
 
 def _get_dynamodb_client(region_name):
@@ -157,6 +159,40 @@ def _get_permutations(perm_table_env, normalized_item, region_candidates):
     return []
 
 
+def _build_state_sk(normalized_item):
+    return 'LUNKER#' + normalized_item + '#'
+
+
+def _get_state_record(state_table_name, normalized_item, state_region):
+    dynamodb = _get_dynamodb_client(state_region)
+    response = dynamodb.get_item(
+        TableName=state_table_name,
+        Key={
+            'pk': {'S': _STATE_PK},
+            'sk': {'S': _build_state_sk(normalized_item)}
+        }
+    )
+    return response.get('Item', {})
+
+
+def _put_state_record(state_table_name, normalized_item, state_region, now_utc):
+    ttl_value = int((now_utc + datetime.timedelta(days=_STATE_TTL_DAYS)).timestamp())
+    dynamodb = _get_dynamodb_client(state_region)
+    dynamodb.put_item(
+        TableName=state_table_name,
+        Item={
+            'pk': {'S': _STATE_PK},
+            'sk': {'S': _build_state_sk(normalized_item)},
+            'lastday': {'S': now_utc.strftime('%Y-%m-%d')},
+            'ttl': {'N': str(ttl_value)}
+        }
+    )
+
+
+def _is_monthly_full_search_time(now_utc):
+    return now_utc.day == 1 and now_utc.hour == 2
+
+
 def handler(event, _context):
     print(event)
 
@@ -169,10 +205,17 @@ def handler(event, _context):
 
     region_candidates = []
     perm_table_env = os.environ.get('DYNAMODB_TABLE', '').strip()
+    state_table_name = os.environ.get('STATE_DYNAMODB_TABLE', '').strip()
+    state_region = os.environ.get('STATE_DYNAMODB_REGION', 'us-east-2').strip() or 'us-east-2'
     if not perm_table_env:
         return {
             'statusCode': 500,
             'body': json.dumps({'message': 'Missing DYNAMODB_TABLE environment variable'})
+        }
+    if not state_table_name:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': 'Missing STATE_DYNAMODB_TABLE environment variable'})
         }
 
     if perm_table_env.startswith('arn:'):
@@ -204,7 +247,7 @@ def handler(event, _context):
     print('WHERE clause terms: ' + str(len(terms)))
     print('WHERE clause mode: ' + ('lower(sld) exact match' if exact_sld_match else 'lower(dns) LIKE'))
 
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc)
     date_stem = now.strftime('%Y-%m-%d-%H-%M-%S')
 
     output_prefix = _safe_path_value(normalized_item) + '/' + date_stem + '/'
@@ -213,6 +256,24 @@ def handler(event, _context):
     table = os.environ.get('ATHENA_TABLE', 'domains')
     output_bucket = os.environ['OUTPUT_BUCKET']
     temp_bucket = os.environ['TEMP_BUCKET']
+
+    state_item = _get_state_record(state_table_name, normalized_item, state_region)
+    has_state_entry = bool(state_item)
+    is_monthly_full = _is_monthly_full_search_time(now)
+
+    partition_clause = ''
+    if has_state_entry and not is_monthly_full:
+        partition_clause = (
+            'year = ' + str(now.year)
+            + ' AND month = ' + str(now.month)
+            + ' AND day = ' + str(now.day)
+        )
+
+    if partition_clause:
+        where_clause = '(' + where_clause + ') AND ' + partition_clause
+
+    search_mode = 'full' if not partition_clause else 'daily-current-day'
+    print('Search mode: ' + search_mode)
 
     query = (
         'UNLOAD ('
@@ -239,6 +300,8 @@ def handler(event, _context):
     query_execution_id = response['QueryExecutionId']
     print('QueryExecutionId: ' + query_execution_id)
 
+    _put_state_record(state_table_name, normalized_item, state_region, now)
+
     return {
         'statusCode': 200,
         'body': json.dumps(
@@ -246,6 +309,7 @@ def handler(event, _context):
                 'message': 'Athena search started',
                 'item': item,
                 'terms': terms,
+                'searchMode': search_mode,
                 'queryExecutionId': query_execution_id,
                 'output': 's3://' + output_bucket + '/' + output_prefix
             }

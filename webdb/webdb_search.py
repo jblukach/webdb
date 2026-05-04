@@ -55,6 +55,7 @@ class WebdbSearch(Stack):
                     'glue:GetPartitions',
                     'glue:BatchGetPartition',
                     'dynamodb:GetItem',
+                    'dynamodb:PutItem',
                     'dynamodb:DescribeTable',
                     's3:GetBucketLocation',
                     's3:GetObject',
@@ -77,6 +78,8 @@ class WebdbSearch(Stack):
             handler = 'search.handler',
             environment = dict(
                 DYNAMODB_TABLE = 'arn:aws:dynamodb:'+region+':'+lunker.string_value+':table/permutation',
+                STATE_DYNAMODB_TABLE = 'state',
+                STATE_DYNAMODB_REGION = 'us-east-2',
                 ATHENA_DATABASE = 'webdb',
                 ATHENA_TABLE = 'domains',
                 ATHENA_WORKGROUP = 'webdb',
@@ -85,6 +88,7 @@ class WebdbSearch(Stack):
             ),
             timeout = Duration.seconds(900),
             memory_size = 512,
+            ephemeral_storage_size = Size.mebibytes(512),
             role = role
         )
 
