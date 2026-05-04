@@ -109,7 +109,7 @@ def _get_permutations(perm_table_env, normalized_item, region_candidates):
 
     print('DynamoDB lookup - table_identifiers=' + str(table_identifiers))
     print('DynamoDB lookup - region_candidates=' + str(region_candidates))
-    print('DynamoDB lookup - key=pk:LUNKER#, sk:LUNKER#' + normalized_item)
+    print('DynamoDB lookup - key=pk:LUNKER#, sk:LUNKER#' + normalized_item + '#')
 
     for perm_region in region_candidates:
         if not perm_region:
@@ -124,7 +124,7 @@ def _get_permutations(perm_table_env, normalized_item, region_candidates):
                     TableName=table_identifier,
                     Key={
                         'pk': {'S': 'LUNKER#'},
-                        'sk': {'S': 'LUNKER#' + normalized_item}
+                        'sk': {'S': 'LUNKER#' + normalized_item + '#'}
                     },
                     ProjectionExpression='perm'
                 )

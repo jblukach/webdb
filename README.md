@@ -50,7 +50,7 @@
 | Attribute | Value |
 | --- | --- |
 | `pk` | `LUNKER#` |
-| `sk` | `LUNKER#<search>#<domain>` |
+| `sk` | `LUNKER#<search>#<domain>#` |
 | `domain` | fully qualified domain name |
 | `search` | first folder from the S3 object key |
 | `sld` | second-level domain |
@@ -137,7 +137,7 @@ Lookup behavior:
 
 1. Reads permutations from DynamoDB table `permutation` in the lunker account.
 2. Requires `DYNAMODB_TABLE` to be set (recommended: full table ARN for cross-account access).
-3. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>`.
+3. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>#`.
 4. Reads the `perm` attribute and normalizes/de-duplicates values.
 
 Query behavior:
