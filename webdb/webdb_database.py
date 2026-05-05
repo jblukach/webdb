@@ -21,6 +21,11 @@ class WebdbDatabase(Stack):
             parameter_name = '/account/lunker'
         )
 
+        webmonitor = _ssm.StringParameter.from_string_parameter_attributes(
+            self, 'webmonitor',
+            parameter_name = '/account/webmonitor'
+        )
+
         def replica_resource_policy(region: str) -> _iam.PolicyDocument:
             return _iam.PolicyDocument(
                 statements = [
@@ -50,7 +55,27 @@ class WebdbDatabase(Stack):
                                 resource_name = 'possibilities/index/*',
                             ),
                         ],
-                    )
+                    ),
+                    _iam.PolicyStatement(
+                        sid = 'AllowWebmonitorSearchBatchWrite',
+                        effect = _iam.Effect.ALLOW,
+                        principals = [
+                            _iam.ArnPrincipal(
+                                f'arn:aws:iam::{webmonitor.string_value}:root'
+                            )
+                        ],
+                        actions = [
+                            'dynamodb:BatchWriteItem',
+                        ],
+                        resources = [
+                            self.format_arn(
+                                service = 'dynamodb',
+                                region = region,
+                                resource = 'table',
+                                resource_name = 'possibilities',
+                            ),
+                        ],
+                    ),
                 ]
             )
 
