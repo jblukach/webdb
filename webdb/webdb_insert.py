@@ -3,11 +3,14 @@ from aws_cdk import (
     RemovalPolicy,
     Size,
     Stack,
+    aws_dynamodb as _dynamodb,
+    aws_glue as _glue,
     aws_iam as _iam,
     aws_lambda as _lambda,
     aws_lambda_event_sources as _event_sources,
     aws_logs as _logs,
     aws_s3 as _s3,
+    aws_s3_assets as _assets,
     aws_s3_notifications as _notifications,
     aws_sqs as _sqs
 )
@@ -78,16 +81,78 @@ class WebdbInsert(Stack):
             _s3.NotificationKeyFilter(suffix = '.jsonl')
         )
 
-        insert = _lambda.DockerImageFunction(
+        glue_script_asset = _assets.Asset(
+            self, 'insert-glue-job-script',
+            path = 'insert/glue_insert_job.py'
+        )
+
+        glue_job_role = _iam.Role(
+            self, 'insert-glue-job-role',
+            assumed_by = _iam.ServicePrincipal('glue.amazonaws.com'),
+            managed_policies = [
+                _iam.ManagedPolicy.from_aws_managed_policy_name('service-role/AWSGlueServiceRole')
+            ]
+        )
+
+        insert_bucket.grant_read(glue_job_role)
+        database_bucket.grant_read_write(glue_job_role)
+        glue_script_asset.grant_read(glue_job_role)
+
+        glue_job = _glue.CfnJob(
+            self, 'insert-glue-job',
+            name = f'webdb-{region}-insert-iceberg',
+            role = glue_job_role.role_arn,
+            glue_version = '5.0',
+            worker_type = 'G.1X',
+            number_of_workers = 2,
+            execution_property = _glue.CfnJob.ExecutionPropertyProperty(
+                max_concurrent_runs = 4
+            ),
+            command = _glue.CfnJob.JobCommandProperty(
+                name = 'glueetl',
+                python_version = '3',
+                script_location = glue_script_asset.s3_object_url
+            ),
+            default_arguments = {
+                '--job-language': 'python',
+                '--datalake-formats': 'iceberg',
+                '--warehouse_path': f's3://{database_bucket.bucket_name}/',
+                '--enable-glue-datacatalog': 'true',
+                '--enable-continuous-cloudwatch-log': 'true',
+                '--enable-metrics': 'true'
+            },
+            timeout = 60,
+            max_retries = 0
+        )
+
+        processed_objects_table = _dynamodb.Table(
+            self, 'processed-objects',
+            table_name = f'webdb-{region}-processed-objects',
+            billing_mode = _dynamodb.BillingMode.PAY_PER_REQUEST,
+            partition_key = _dynamodb.Attribute(
+                name = 'pk',
+                type = _dynamodb.AttributeType.STRING
+            ),
+            point_in_time_recovery = False,
+            removal_policy = RemovalPolicy.DESTROY,
+            time_to_live_attribute = 'ttl'
+        )
+
+        insert = _lambda.Function(
             self, 'insert',
-            code = _lambda.DockerImageCode.from_image_asset('insert'),
+            runtime = _lambda.Runtime.PYTHON_3_12,
+            handler = 'insert.handler',
+            code = _lambda.Code.from_asset('insert'),
             architecture = _lambda.Architecture.X86_64,
             timeout = Duration.seconds(900),
             memory_size = 4096,
             ephemeral_storage_size = Size.gibibytes(2),
             environment = {
-                'DATABASE_BUCKET': database_bucket.bucket_name,
-                'ARCHIVE_BUCKET': archive_bucket.bucket_name
+                'ARCHIVE_BUCKET': archive_bucket.bucket_name,
+                'GLUE_JOB_NAME': glue_job.name,
+                'GLUE_TIMEOUT_SECONDS': '840',
+                'GLUE_POLL_SECONDS': '10',
+                'PROCESSED_OBJECTS_TABLE': processed_objects_table.table_name
             }
         )
 
@@ -100,8 +165,26 @@ class WebdbInsert(Stack):
 
         insert_bucket.grant_read(insert)
         insert_bucket.grant_delete(insert)
-        database_bucket.grant_put(insert)
         archive_bucket.grant_put(insert)
+        processed_objects_table.grant_read_write_data(insert)
+        insert.add_to_role_policy(
+            _iam.PolicyStatement(
+                actions = [
+                    'glue:StartJobRun',
+                    'glue:GetJobRun',
+                    'glue:BatchStopJobRun'
+                ],
+                resources = [
+                    Stack.of(self).format_arn(
+                        service = 'glue',
+                        resource = 'job',
+                        resource_name = glue_job.name
+                    )
+                ]
+            )
+        )
+
+        insert.node.add_dependency(glue_job)
 
         insert.add_event_source(
             _event_sources.SqsEventSource(

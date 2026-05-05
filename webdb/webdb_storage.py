@@ -1,9 +1,11 @@
 from aws_cdk import (
+    CfnOutput,
     Duration,
     RemovalPolicy,
     Stack,
     aws_athena as _athena,
     aws_glue as _glue,
+    aws_iam as _iam,
     aws_s3 as _s3
 )
 
@@ -48,26 +50,23 @@ class WebdbStorage(Stack):
             self, 'webdb-glue-domains-table',
             catalog_id = Stack.of(self).account,
             database_name = 'webdb',
+            open_table_format_input = _glue.CfnTable.OpenTableFormatInputProperty(
+                iceberg_input = _glue.CfnTable.IcebergInputProperty(
+                    metadata_operation = 'CREATE',
+                    version = '2'
+                )
+            ),
             table_input = _glue.CfnTable.TableInputProperty(
                 name = 'domains',
-                description = 'Domains parquet table for Athena',
+                description = 'Domains Iceberg table for Athena',
                 table_type = 'EXTERNAL_TABLE',
                 parameters = {
-                    'classification': 'parquet',
-                    'typeOfData': 'file',
-                    'projection.enabled': 'true',
-                    'projection.year.type': 'integer',
-                    'projection.year.range': '2020,2100',
-                    'projection.month.type': 'integer',
-                    'projection.month.range': '1,12',
-                    'projection.month.digits': '2',
-                    'projection.day.type': 'integer',
-                    'projection.day.range': '1,31',
-                    'projection.day.digits': '2',
-                    'storage.location.template': f's3://webdb-{region}-database/year=${{year}}/month=${{month}}/day=${{day}}/'
+                    'table_type': 'ICEBERG',
+                    'format': 'parquet',
+                    'write_compression': 'zstd'
                 },
                 storage_descriptor = _glue.CfnTable.StorageDescriptorProperty(
-                    location = f's3://webdb-{region}-database/',
+                    location = f's3://webdb-{region}-database/domains/',
                     input_format = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
                     output_format = 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
                     compressed = False,
@@ -85,7 +84,10 @@ class WebdbStorage(Stack):
                         _glue.CfnTable.ColumnProperty(name = 'id', type = 'string'),
                         _glue.CfnTable.ColumnProperty(name = 'sld', type = 'string'),
                         _glue.CfnTable.ColumnProperty(name = 'tld', type = 'string'),
-                        _glue.CfnTable.ColumnProperty(name = 'asn', type = 'bigint')
+                        _glue.CfnTable.ColumnProperty(name = 'asn', type = 'bigint'),
+                        _glue.CfnTable.ColumnProperty(name = 'year', type = 'int'),
+                        _glue.CfnTable.ColumnProperty(name = 'month', type = 'int'),
+                        _glue.CfnTable.ColumnProperty(name = 'day', type = 'int')
                     ],
                     serde_info = _glue.CfnTable.SerdeInfoProperty(
                         serialization_library = 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
@@ -94,18 +96,61 @@ class WebdbStorage(Stack):
             )
         )
 
-        domains_table.add_property_override(
-            'TableInput.PartitionKeys',
-            [
-                {'Name': 'year', 'Type': 'int'},
-                {'Name': 'month', 'Type': 'int'},
-                {'Name': 'day', 'Type': 'int'}
+        domains_table.node.add_dependency(glue_database)
+
+        optimizer_role = _iam.Role(
+            self, 'webdb-iceberg-optimizer-role',
+            assumed_by = _iam.ServicePrincipal('glue.amazonaws.com'),
+            managed_policies = [
+                _iam.ManagedPolicy.from_aws_managed_policy_name('service-role/AWSGlueServiceRole')
             ]
         )
 
-        domains_table.node.add_dependency(glue_database)
+        _s3.Bucket.from_bucket_name(
+            self, 'database-bucket-for-optimizer',
+            bucket_name = f'webdb-{region}-database'
+        ).grant_read_write(optimizer_role)
 
-        workgroup = _athena.CfnWorkGroup(
+        optimizer_role.add_to_policy(
+            _iam.PolicyStatement(
+                actions = [
+                    'glue:GetCatalog',
+                    'glue:GetDatabase',
+                    'glue:GetDatabases',
+                    'glue:GetTable',
+                    'glue:GetTables',
+                    'glue:GetTableVersion',
+                    'glue:GetTableVersions',
+                    'glue:UpdateTable'
+                ],
+                resources = [
+                    f'arn:aws:glue:{region}:{Stack.of(self).account}:catalog',
+                    f'arn:aws:glue:{region}:{Stack.of(self).account}:database/webdb',
+                    f'arn:aws:glue:{region}:{Stack.of(self).account}:table/webdb/domains'
+                ]
+            )
+        )
+
+        optimizer_role.add_to_policy(
+            _iam.PolicyStatement(
+                actions = ['lakeformation:GetDataAccess'],
+                resources = ['*']
+            )
+        )
+
+        _ = CfnOutput(
+            self, 'webdb-iceberg-optimizer-role-arn',
+            description = 'IAM role ARN to select when enabling Glue Iceberg table optimization in console',
+            value = optimizer_role.role_arn
+        )
+
+        _ = CfnOutput(
+            self, 'webdb-iceberg-optimizer-role-name',
+            description = 'IAM role name for Glue Iceberg table optimization in console',
+            value = optimizer_role.role_name
+        )
+
+        _ = _athena.CfnWorkGroup(
             self, 'webdb-athena-workgroup',
             name = 'webdb',
             description = 'Athena workgroup for webdb queries',

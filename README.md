@@ -7,17 +7,18 @@
 | Stack | Description |
 | --- | --- |
 | `WebdbDatabase` | DynamoDB table infrastructure, including the shared `possibilities` table for cross-account access from lunker |
-| `WebdbStorage` | S3 buckets, Glue database/table, and Athena workgroup/query resources |
+| `WebdbStorage` | S3 buckets, Glue Iceberg table, console-ready optimizer IAM role, and Athena workgroup/query resources |
 | `WebdbTransfer` | Scheduled Lambda that copies source data into the enrich bucket |
 | `WebdbEnrich` | Event-driven Lambda that enriches domain records with GeoIP data |
-| `WebdbInsert` | S3/SQS-triggered Docker Lambda that converts JSONL to Parquet, writes database data, and archives gzip JSONL |
+| `WebdbInsert` | S3/SQS-triggered Python Lambda that starts a Glue Spark job to append into Iceberg, then archives gzip JSONL |
 | `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations from shared DynamoDB and runs Athena UNLOAD of unique domain matches |
 | `WebdbOutput` | S3/SQS-triggered Lambda that ingests gzip output files and batch-writes discovered domains into DynamoDB |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
 
 ## Table Schema
 
-`webdb.domains` Glue external table (partitioned by `year`,`month`,`day`):
+`webdb.domains` Glue Iceberg v2 table (with `year`,`month`,`day` date columns).
+The Glue ingest job enforces Iceberg partition fields on these columns.
 
 | Column | Type |
 | --- | --- |
@@ -35,6 +36,9 @@
 | `sld` | string |
 | `tld` | string |
 | `asn` | bigint |
+| `year` | int |
+| `month` | int |
+| `day` | int |
 
 ## DynamoDB
 
@@ -44,6 +48,14 @@
 | --- | --- |
 | `pk` | partition key |
 | `sk` | sort key |
+
+`WebdbInsert` creates the `processed-objects` DynamoDB table in the current region to track ingest idempotency:
+
+| Attribute | Purpose |
+| --- | --- |
+| `pk` | `<bucket>#<key>` composite key |
+| `processed_at` | Unix timestamp of processing |
+| `ttl` | Auto-expiration (30 days) |
 
 `WebdbOutput` writes items with this layout:
 
@@ -80,6 +92,8 @@ cdk deploy --profile db --all
 cdk diff --profile db --all
 ```
 
+Note: CDK deploy provisions the Iceberg optimization IAM role, but compaction/retention/orphan-file optimization settings are configured in the AWS Glue console.
+
 ## Athena Performance
 
 - Always filter by partitions (`year`, `month`, `day`) to reduce scanned data.
@@ -98,13 +112,33 @@ ORDER BY ts DESC
 LIMIT 100;
 ```
 
+## Iceberg Optimization Role
+
+`WebdbStorage` creates one IAM role for AWS Glue Iceberg table optimization in the AWS console.
+
+- Output `webdb-iceberg-optimizer-role-arn`: full role ARN
+- Output `webdb-iceberg-optimizer-role-name`: IAM role name
+- Trust principal: `glue.amazonaws.com`
+- Included access: S3 read/write for `webdb-<region>-database`, Glue catalog/database/table metadata permissions for `webdb.domains`, and Lake Formation `GetDataAccess`.
+
+Console setup:
+
+1. Open the `WebdbStorage` stack in CloudFormation and copy either output.
+2. In Glue, open table `webdb.domains` and go to table optimizations.
+3. Configure compaction/snapshot retention/orphan file cleanup and provide this role.
+
+Use the ARN when the console/API asks for Role ARN. Use the role name when the UI asks you to select by name.
+
 ## Insert Pipeline Behavior
 
-`WebdbInsert` ingests `.jsonl` objects from the insert bucket and performs three actions:
+`WebdbInsert` ingests `.jsonl` objects from the insert bucket with built-in idempotency and resilience:
 
-1. Converts JSONL to Parquet and writes to the database bucket.
-2. Writes the original payload as gzip JSONL to the archive bucket.
-3. Deletes the original source object from the insert bucket.
+1. **Idempotency check** — Queries `processed-objects` DynamoDB table to skip already-processed files (prevents duplicate rows on SQS redelivery or manual reruns).
+2. **Glue ingest** — Starts a Glue Spark job that normalizes JSONL rows and appends them into the `webdb.domains` Iceberg table.
+   - **First-run resilience** — If the table does not exist, the Glue job creates it with Iceberg v2 formatting and year/month/day partitioning, then inserts the batch.
+   - **Partition field enforcement** — On subsequent runs, adds partition fields if missing (idempotent via exception handling).
+3. **Archive & cleanup** — After Glue succeeds, writes the original payload as gzip JSONL to the archive bucket and deletes the source object.
+4. **Idempotency record** — Records the file as processed in DynamoDB with a 30-day TTL for cleanup.
 
 Partition date resolution order:
 
@@ -114,8 +148,13 @@ Partition date resolution order:
 
 Current object key layout:
 
-- Database Parquet: `year=YYYY/month=MM/day=DD/<source-stem>.parquet`
 - Archive gzip JSONL: `year=YYYY/month=MM/day=DD/<source-filename>.gz`
+
+Idempotency guarantees:
+
+- Duplicate files processed within a 30-day window are silently skipped (no Glue job triggered, no duplicates inserted).
+- Processed file records auto-expire after 30 days, allowing the same file to be re-ingested if needed.
+- If `PROCESSED_OBJECTS_TABLE` environment variable is not set, idempotency is disabled (graceful degradation).
 
 ## Splitting Large Source Files
 
@@ -175,6 +214,6 @@ Current runtime configuration:
 - [app.py](app.py) — CDK app entry point
 - [webdb/](webdb/) — CDK stack definitions
 - [enrich/](enrich/) — enrichment Lambda handler
-- [insert/](insert/) — Docker Lambda for JSONL to Parquet conversion
+- [insert/](insert/) — Python Lambda handler and Glue Spark ingest job for Iceberg appends
 - [output/](output/) — Lambda for gzip output ingestion into DynamoDB
 - [transfer/](transfer/) — transfer Lambda handler

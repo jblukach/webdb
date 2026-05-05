@@ -3,82 +3,61 @@ import gzip
 import json
 import os
 import re
+import time
 from urllib.parse import unquote_plus
 
 import boto3
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 
-DATABASE_BUCKET = os.environ['DATABASE_BUCKET']
 ARCHIVE_BUCKET = os.environ['ARCHIVE_BUCKET']
-PARQUET_COMPRESSION = 'zstd'
-PARQUET_TARGET_ROW_GROUP_SIZE = 100000
+GLUE_JOB_NAME = os.environ['GLUE_JOB_NAME']
+GLUE_TIMEOUT_SECONDS = int(os.environ.get('GLUE_TIMEOUT_SECONDS', '840'))
+GLUE_POLL_SECONDS = int(os.environ.get('GLUE_POLL_SECONDS', '10'))
+PROCESSED_OBJECTS_TABLE = os.environ.get('PROCESSED_OBJECTS_TABLE', '')
 
 
-SCHEMA = pa.schema(
-    [
-        pa.field('dns', pa.string()),
-        pa.field('ns', pa.list_(pa.string())),
-        pa.field('ip', pa.string()),
-        pa.field('co', pa.string()),
-        pa.field('web', pa.string()),
-        pa.field('eml', pa.string()),
-        pa.field('hold', pa.string()),
-        pa.field('tel', pa.int64()),
-        pa.field('rank', pa.int64()),
-        pa.field('ts', pa.string()),
-        pa.field('id', pa.string()),
-        pa.field('sld', pa.string()),
-        pa.field('tld', pa.string()),
-        pa.field('asn', pa.int64()),
-    ]
-)
+def _make_processed_pk(source_bucket, source_key):
+    return f'{source_bucket}#{source_key}'
 
 
-def _coerce_int(value):
-    if value in (None, '', '-'):
-        return None
+def _is_already_processed(dynamodb_client, source_bucket, source_key):
+    if not PROCESSED_OBJECTS_TABLE:
+        return False
 
-    if isinstance(value, int):
-        return value
+    pk = _make_processed_pk(source_bucket, source_key)
 
     try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
+        response = dynamodb_client.get_item(
+            TableName = PROCESSED_OBJECTS_TABLE,
+            Key = {'pk': {'S': pk}}
+        )
+        return 'Item' in response
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f'Failed to check processed status: {str(exc)}')
+        return False
 
 
-def _coerce_ns(value):
-    if isinstance(value, list):
-        return [str(item) for item in value if item not in (None, '')]
+def _mark_as_processed(dynamodb_client, source_bucket, source_key):
+    if not PROCESSED_OBJECTS_TABLE:
+        return
 
-    if value in (None, '', '-'):
-        return ['-']
+    pk = _make_processed_pk(source_bucket, source_key)
+    ttl_epoch = int(time.time()) + (86400 * 30)  # 30 days
 
-    return [str(value)]
-
-
-def _normalize_record(record):
-    return {
-        'dns': str(record.get('dns', '-')),
-        'ns': _coerce_ns(record.get('ns')),
-        'ip': str(record.get('ip', '-')),
-        'co': str(record.get('co', '-')),
-        'web': str(record.get('web', '-')),
-        'eml': str(record.get('eml', '-')),
-        'hold': str(record.get('hold', '-')),
-        'tel': _coerce_int(record.get('tel')),
-        'rank': _coerce_int(record.get('rank')),
-        'ts': str(record.get('ts', '-')),
-        'id': str(record.get('id', '-')),
-        'sld': str(record.get('sld', '-')),
-        'tld': str(record.get('tld', '-')),
-        'asn': _coerce_int(record.get('asn')),
-    }
+    try:
+        dynamodb_client.put_item(
+            TableName = PROCESSED_OBJECTS_TABLE,
+            Item = {
+                'pk': {'S': pk},
+                'processed_at': {'N': str(int(time.time()))},
+                'ttl': {'N': str(ttl_epoch)}
+            }
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f'Failed to mark as processed: {str(exc)}')
 
 
-def _partition_date(source_key, records):
+def _partition_date(source_key, source_bytes):
     source_filename = os.path.basename(source_key)
     filename_match = re.match(r'^(\d{4})[-_]?(\d{2})[-_]?(\d{2})', source_filename)
 
@@ -89,63 +68,64 @@ def _partition_date(source_key, records):
         except ValueError:
             pass
 
-    ts_value = str(records[0].get('ts', '')).strip()
+    for raw_line in source_bytes.decode('utf-8').splitlines():
+        if not raw_line.strip():
+            continue
 
-    if len(ts_value) >= 10:
-        candidate = ts_value[:10]
         try:
-            dt = datetime.datetime.strptime(candidate, '%Y-%m-%d')
-            return dt
+            first_record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            break
+
+        ts_value = str(first_record.get('ts', '')).strip()
+        if len(ts_value) < 10:
+            break
+
+        try:
+            return datetime.datetime.strptime(ts_value[:10], '%Y-%m-%d')
         except ValueError:
-            pass
+            break
 
     return datetime.datetime.utcnow()
 
 
-def _convert_object(s3_client, source_bucket, source_key):
-    source_obj = s3_client.get_object(Bucket = source_bucket, Key = source_key)
-    source_bytes = source_obj['Body'].read()
+def _wait_for_glue(glue_client, job_run_id):
+    started_at = time.time()
 
-    records = []
-    for raw_line in source_bytes.decode('utf-8').splitlines():
-        if not raw_line.strip():
-            continue
-        record = json.loads(raw_line)
-        records.append(_normalize_record(record))
+    while True:
+        response = glue_client.get_job_run(
+            JobName = GLUE_JOB_NAME,
+            RunId = job_run_id,
+            PredecessorsIncluded = False
+        )
+        state = response.get('JobRun', {}).get('JobRunState', 'UNKNOWN')
 
-    if not records:
-        print(f'Skipping empty file s3://{source_bucket}/{source_key}')
-        return
+        if state == 'SUCCEEDED':
+            return
 
-    table = pa.Table.from_pylist(records, schema = SCHEMA)
-    partition_dt = _partition_date(source_key, records)
+        if state in ('FAILED', 'STOPPED', 'TIMEOUT', 'ERROR', 'EXPIRED'):
+            raise RuntimeError('Glue job failed in state ' + state)
+
+        elapsed = time.time() - started_at
+        if elapsed >= GLUE_TIMEOUT_SECONDS:
+            try:
+                glue_client.batch_stop_job_run(
+                    JobName = GLUE_JOB_NAME,
+                    JobRunIds = [job_run_id]
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                print('Failed to stop timed out Glue job ' + job_run_id + ': ' + str(exc))
+
+            raise TimeoutError('Glue job timed out after ' + str(GLUE_TIMEOUT_SECONDS) + ' seconds')
+
+        time.sleep(GLUE_POLL_SECONDS)
+
+
+def _archive_and_delete(s3_client, source_bucket, source_key, source_bytes, partition_dt):
     year = partition_dt.strftime('%Y')
     month = partition_dt.strftime('%m')
     day = partition_dt.strftime('%d')
-
     source_filename = os.path.basename(source_key)
-    parquet_stem = os.path.splitext(source_filename)[0]
-    parquet_key = f'year={year}/month={month}/day={day}/{parquet_stem}.parquet'
-    local_parquet_path = f'/tmp/{parquet_stem}.parquet'
-
-    row_group_size = min(len(records), PARQUET_TARGET_ROW_GROUP_SIZE)
-    pq.write_table(
-        table,
-        local_parquet_path,
-        compression = PARQUET_COMPRESSION,
-        use_dictionary = True,
-        write_statistics = True,
-        row_group_size = row_group_size
-    )
-
-    s3_client.upload_file(
-        local_parquet_path,
-        DATABASE_BUCKET,
-        parquet_key,
-        ExtraArgs = {'ContentType': 'application/x-parquet'}
-    )
-    print(f'Uploaded s3://{DATABASE_BUCKET}/{parquet_key}')
-
     archive_key = f'year={year}/month={month}/day={day}/{source_filename}.gz'
 
     archive_body = gzip.compress(source_bytes)
@@ -161,14 +141,46 @@ def _convert_object(s3_client, source_bucket, source_key):
     s3_client.delete_object(Bucket = source_bucket, Key = source_key)
     print(f'Deleted s3://{source_bucket}/{source_key}')
 
-    try:
-        os.remove(local_parquet_path)
-    except OSError:
-        pass
+
+def _convert_object(s3_client, glue_client, dynamodb_client, source_bucket, source_key):
+    if _is_already_processed(dynamodb_client, source_bucket, source_key):
+        print(f'Skipping already-processed file s3://{source_bucket}/{source_key}')
+        return
+
+    source_obj = s3_client.get_object(Bucket = source_bucket, Key = source_key)
+    source_bytes = source_obj['Body'].read()
+
+    if not source_bytes.strip():
+        print(f'Skipping empty file s3://{source_bucket}/{source_key}')
+        _mark_as_processed(dynamodb_client, source_bucket, source_key)
+        return
+
+    partition_dt = _partition_date(source_key, source_bytes)
+
+    job_response = glue_client.start_job_run(
+        JobName = GLUE_JOB_NAME,
+        Arguments = {
+            '--source_bucket': source_bucket,
+            '--source_key': source_key,
+            '--database': 'webdb',
+            '--table': 'domains',
+            '--year': str(partition_dt.year),
+            '--month': str(partition_dt.month),
+            '--day': str(partition_dt.day),
+        }
+    )
+    job_run_id = job_response['JobRunId']
+    print('Started Glue job run ' + job_run_id + ' for s3://' + source_bucket + '/' + source_key)
+
+    _wait_for_glue(glue_client, job_run_id)
+    _archive_and_delete(s3_client, source_bucket, source_key, source_bytes, partition_dt)
+    _mark_as_processed(dynamodb_client, source_bucket, source_key)
 
 
 def handler(event, _context):
     s3_client = boto3.client('s3')
+    glue_client = boto3.client('glue')
+    dynamodb_client = boto3.client('dynamodb')
 
     for sqs_record in event.get('Records', []):
         body = sqs_record.get('body', '{}')
@@ -192,6 +204,6 @@ def handler(event, _context):
                 print(f'Skipping non-jsonl key {source_key}')
                 continue
 
-            _convert_object(s3_client, source_bucket, source_key)
+            _convert_object(s3_client, glue_client, dynamodb_client, source_bucket, source_key)
 
     return {'statusCode': 200}
