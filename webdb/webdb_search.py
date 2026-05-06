@@ -88,7 +88,7 @@ class WebdbSearch(Stack):
             ),
             timeout = Duration.seconds(900),
             memory_size = 512,
-            ephemeral_storage_size = Size.mebibytes(512),
+            ephemeral_storage_size = Size.gibibytes(1),
             role = role
         )
 

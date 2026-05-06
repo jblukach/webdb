@@ -143,10 +143,10 @@ class WebdbInsert(Stack):
             runtime = _lambda.Runtime.PYTHON_3_12,
             handler = 'insert.handler',
             code = _lambda.Code.from_asset('insert'),
-            architecture = _lambda.Architecture.X86_64,
+            architecture = _lambda.Architecture.ARM_64,
             timeout = Duration.seconds(900),
-            memory_size = 4096,
-            ephemeral_storage_size = Size.gibibytes(2),
+            memory_size = 2048,
+            ephemeral_storage_size = Size.gibibytes(1),
             environment = {
                 'ARCHIVE_BUCKET': archive_bucket.bucket_name,
                 'GLUE_JOB_NAME': glue_job.name,

@@ -204,10 +204,39 @@ Output behavior:
 
 Current runtime configuration:
 
-- Lambda memory: `1024 MB`
+- Lambda memory: `2048 MB`
 - Lambda ephemeral storage: `1 GiB`
 - SQS batch size: `10`
 - DynamoDB batch write size: `25`
+
+## Lambda Sizing Guidance
+
+All pipeline Lambdas are configured with a `900` second timeout by design to tolerate slow upstream/downstream dependencies (S3, Glue, Athena) without premature retries.
+
+Current stack runtime sizing:
+
+| Lambda | Memory | Ephemeral Storage | Notes |
+| --- | --- | --- | --- |
+| `transfer` | `512 MB` | `1 GiB` | Downloads/uploads one CSV object via `/tmp` |
+| `unzip` | `2048 MB` | `1 GiB` | Reads gzip fully in memory, then decompresses fully in memory |
+| `enrich` | `2048 MB` | `1 GiB` | Reads source file into `/tmp`, writes JSONL output, GeoIP lookups |
+| `insert` | `4096 MB` | `2 GiB` | Reads JSONL into memory, starts/polls Glue, archives gzip |
+| `search` | `512 MB` | `512 MiB` | Mostly orchestration (DynamoDB + Athena UNLOAD) |
+| `output` | `2048 MB` | `1 GiB` | Downloads gzip to `/tmp`, decompresses and batch-writes to DynamoDB |
+
+Recommended right-size baseline (no timeout changes):
+
+1. Keep `enrich`, `output`, and `search` as-is unless CloudWatch metrics show sustained low utilization.
+2. Reduce `transfer` ephemeral storage from `1 GiB` to `512 MiB` if source CSV files fit comfortably.
+3. Reduce `insert` ephemeral storage from `2 GiB` to `512 MiB` because the current handler is memory-driven rather than `/tmp`-driven.
+4. Treat `unzip` memory as the primary risk knob (it currently holds both compressed and decompressed payloads in memory at once). If large files are common, increase memory before increasing ephemeral storage.
+
+Validation metrics to watch after any sizing change:
+
+- `Max Memory Used` (CloudWatch Lambda Insights or REPORT logs)
+- `Duration` and `Timeouts`
+- SQS `ApproximateAgeOfOldestMessage` and DLQ message count
+- Error rate/retries during high-volume ingest windows
 
 ## Repository Layout
 

@@ -11,6 +11,7 @@ from webdb.webdb_output import WebdbOutput
 from webdb.webdb_search import WebdbSearch
 from webdb.webdb_storage import WebdbStorage
 from webdb.webdb_transfer import WebdbTransfer
+from webdb.webdb_unzip import WebdbUnzip
 
 app = cdk.App()
 
@@ -71,6 +72,17 @@ WebdbTransfer(
 
 WebdbInsert(
     app, 'WebdbInsert',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbUnzip(
+    app, 'WebdbUnzip',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'

@@ -18,7 +18,7 @@ class WebdbStorage(Stack):
 
         region = Stack.of(self).region
 
-        for namespace in ['database', 'enrich', 'insert', 'archive', 'temporary', 'output']:
+        for namespace in ['database', 'enrich', 'unzip', 'insert', 'archive', 'temporary', 'output']:
 
             bucket = _s3.Bucket(
                 self, namespace,
