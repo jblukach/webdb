@@ -148,13 +148,11 @@ class WebdbInsert(Stack):
             memory_size = 2048,
             ephemeral_storage_size = Size.gibibytes(1),
             environment = {
-                'ARCHIVE_BUCKET': archive_bucket.bucket_name,
                 'GLUE_JOB_NAME': glue_job.name,
-                'GLUE_TIMEOUT_SECONDS': '840',
-                'GLUE_POLL_SECONDS': '10',
                 'GLUE_START_TIMEOUT_SECONDS': '30',
                 'GLUE_START_BACKOFF_SECONDS': '15',
-                'PROCESSED_OBJECTS_TABLE': processed_objects_table.table_name
+                'PROCESSED_OBJECTS_TABLE': processed_objects_table.table_name,
+                'EXECUTION_TABLE': f'webdb-{region}-executions'
             }
         )
 
@@ -169,6 +167,13 @@ class WebdbInsert(Stack):
         insert_bucket.grant_delete(insert)
         archive_bucket.grant_put(insert)
         processed_objects_table.grant_read_write_data(insert)
+
+        execution_table = _dynamodb.TableV2.from_table_name(
+            self, 'executions',
+            table_name = f'webdb-{region}-executions'
+        )
+        execution_table.grant_write_data(insert)
+
         insert.add_to_role_policy(
             _iam.PolicyStatement(
                 actions = [

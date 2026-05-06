@@ -59,6 +59,7 @@ class WebdbSearch(Stack):
                     'dynamodb:Query',
                     'dynamodb:DeleteItem',
                     'dynamodb:DescribeTable',
+                    'dynamodb:PutItem',
                     's3:GetBucketLocation',
                     's3:GetObject',
                     's3:ListBucket',
@@ -85,6 +86,7 @@ class WebdbSearch(Stack):
                 ATHENA_DATABASE = 'webdb',
                 ATHENA_TABLE = 'domains',
                 ATHENA_WORKGROUP = 'webdb',
+                EXECUTION_TABLE = f'webdb-{region}-executions',
                 OUTPUT_BUCKET = f'webdb-{region}-output',
                 TEMP_BUCKET = f'webdb-{region}-temporary'
             ),
@@ -118,6 +120,6 @@ class WebdbSearch(Stack):
             )
         )
 
-        #event.add_target(
-        #    _targets.LambdaFunction(search)
-        #)
+        event.add_target(
+            _targets.LambdaFunction(search)
+        )

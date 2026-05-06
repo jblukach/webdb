@@ -1,5 +1,4 @@
 import datetime
-import gzip
 import json
 import os
 import re
@@ -10,13 +9,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 
-ARCHIVE_BUCKET = os.environ['ARCHIVE_BUCKET']
 GLUE_JOB_NAME = os.environ['GLUE_JOB_NAME']
-GLUE_TIMEOUT_SECONDS = int(os.environ.get('GLUE_TIMEOUT_SECONDS', '840'))
-GLUE_POLL_SECONDS = int(os.environ.get('GLUE_POLL_SECONDS', '10'))
 GLUE_START_TIMEOUT_SECONDS = int(os.environ.get('GLUE_START_TIMEOUT_SECONDS', '30'))
 GLUE_START_BACKOFF_SECONDS = int(os.environ.get('GLUE_START_BACKOFF_SECONDS', '15'))
 PROCESSED_OBJECTS_TABLE = os.environ.get('PROCESSED_OBJECTS_TABLE', '')
+EXECUTION_TABLE = os.environ['EXECUTION_TABLE']
 
 
 def _make_processed_pk(source_bucket, source_key):
@@ -92,38 +89,6 @@ def _partition_date(source_key, source_bytes):
     return datetime.datetime.utcnow()
 
 
-def _wait_for_glue(glue_client, job_run_id):
-    started_at = time.time()
-
-    while True:
-        response = glue_client.get_job_run(
-            JobName = GLUE_JOB_NAME,
-            RunId = job_run_id,
-            PredecessorsIncluded = False
-        )
-        state = response.get('JobRun', {}).get('JobRunState', 'UNKNOWN')
-
-        if state == 'SUCCEEDED':
-            return
-
-        if state in ('FAILED', 'STOPPED', 'TIMEOUT', 'ERROR', 'EXPIRED'):
-            raise RuntimeError('Glue job failed in state ' + state)
-
-        elapsed = time.time() - started_at
-        if elapsed >= GLUE_TIMEOUT_SECONDS:
-            try:
-                glue_client.batch_stop_job_run(
-                    JobName = GLUE_JOB_NAME,
-                    JobRunIds = [job_run_id]
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                print('Failed to stop timed out Glue job ' + job_run_id + ': ' + str(exc))
-
-            raise TimeoutError('Glue job timed out after ' + str(GLUE_TIMEOUT_SECONDS) + ' seconds')
-
-        time.sleep(GLUE_POLL_SECONDS)
-
-
 def _start_glue_job_run(glue_client, partition_dt, source_bucket, source_key):
     deadline = time.time() + GLUE_START_TIMEOUT_SECONDS
     arguments = {
@@ -137,64 +102,65 @@ def _start_glue_job_run(glue_client, partition_dt, source_bucket, source_key):
     }
 
     while True:
+        retry_exception = None
+
         try:
             return glue_client.start_job_run(
                 JobName = GLUE_JOB_NAME,
                 Arguments = arguments
             )
-        except Exception as exc:  # pylint: disable=broad-except
-            # Retry only when Glue reports job concurrency saturation.
-            is_concurrent_runs_error = isinstance(exc, glue_client.exceptions.ConcurrentRunsExceededException)
-            if not is_concurrent_runs_error and isinstance(exc, ClientError):
-                is_concurrent_runs_error = (
-                    exc.response.get('Error', {}).get('Code') == 'ConcurrentRunsExceededException'
-                )
-
-            if not is_concurrent_runs_error:
+        except glue_client.exceptions.ConcurrentRunsExceededException as exc:
+            retry_exception = exc
+        except ClientError as exc:
+            error_code = exc.response.get('Error', {}).get('Code')
+            if error_code != 'ConcurrentRunsExceededException':
                 raise
+            retry_exception = exc
 
-            remaining_seconds = int(deadline - time.time())
-            if remaining_seconds <= 0:
-                raise TimeoutError(
-                    'Timed out waiting for Glue concurrency slot after '
-                    + str(GLUE_START_TIMEOUT_SECONDS)
-                    + ' seconds'
-                ) from exc
+        remaining_seconds = int(deadline - time.time())
+        if remaining_seconds <= 0:
+            raise TimeoutError(
+                'Timed out waiting for Glue concurrency slot after '
+                + str(GLUE_START_TIMEOUT_SECONDS)
+                + ' seconds'
+            ) from retry_exception
 
-            backoff_seconds = min(GLUE_START_BACKOFF_SECONDS, remaining_seconds)
-            print(
-                'Glue concurrent run limit reached for '
-                + GLUE_JOB_NAME
-                + '; retrying in '
-                + str(backoff_seconds)
-                + ' seconds for s3://'
-                + source_bucket
-                + '/'
-                + source_key
-            )
-            time.sleep(backoff_seconds)
+        backoff_seconds = min(GLUE_START_BACKOFF_SECONDS, remaining_seconds)
+        print(
+            'Glue concurrent run limit reached for '
+            + GLUE_JOB_NAME
+            + '; retrying in '
+            + str(backoff_seconds)
+            + ' seconds for s3://'
+            + source_bucket
+            + '/'
+            + source_key
+        )
+        time.sleep(backoff_seconds)
 
 
-def _archive_and_delete(s3_client, source_bucket, source_key, source_bytes, partition_dt):
-    year = partition_dt.strftime('%Y')
-    month = partition_dt.strftime('%m')
-    day = partition_dt.strftime('%d')
-    source_filename = os.path.basename(source_key)
-    archive_key = f'year={year}/month={month}/day={day}/{source_filename}.gz'
+def _put_execution_record(dynamodb_client, job_run_id, source_bucket, source_key, partition_dt):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ttl_epoch = int(now.timestamp()) + (86400 * 7)
 
-    archive_body = gzip.compress(source_bytes)
-    s3_client.put_object(
-        Bucket = ARCHIVE_BUCKET,
-        Key = archive_key,
-        Body = archive_body,
-        ContentType = 'application/x-ndjson',
-        ContentEncoding = 'gzip'
+    dynamodb_client.put_item(
+        TableName = EXECUTION_TABLE,
+        Item = {
+            'pk': {'S': 'EXEC#' + job_run_id},
+            'sk': {'S': 'GLUE'},
+            'execution_type': {'S': 'GLUE'},
+            'status': {'S': 'PENDING'},
+            'created_at': {'S': now.isoformat()},
+            'ttl': {'N': str(ttl_epoch)},
+            'job_name': {'S': GLUE_JOB_NAME},
+            'source_bucket': {'S': source_bucket},
+            'source_key': {'S': source_key},
+            'partition_year': {'N': str(partition_dt.year)},
+            'partition_month': {'N': str(partition_dt.month)},
+            'partition_day': {'N': str(partition_dt.day)},
+            'processed_objects_table': {'S': PROCESSED_OBJECTS_TABLE},
+        }
     )
-    print(f'Archived s3://{ARCHIVE_BUCKET}/{archive_key}')
-
-    s3_client.delete_object(Bucket = source_bucket, Key = source_key)
-    print(f'Deleted s3://{source_bucket}/{source_key}')
-
 
 def _convert_object(s3_client, glue_client, dynamodb_client, source_bucket, source_key):
     if _is_already_processed(dynamodb_client, source_bucket, source_key):
@@ -215,9 +181,15 @@ def _convert_object(s3_client, glue_client, dynamodb_client, source_bucket, sour
     job_run_id = job_response['JobRunId']
     print('Started Glue job run ' + job_run_id + ' for s3://' + source_bucket + '/' + source_key)
 
-    _wait_for_glue(glue_client, job_run_id)
-    _archive_and_delete(s3_client, source_bucket, source_key, source_bytes, partition_dt)
-    _mark_as_processed(dynamodb_client, source_bucket, source_key)
+    _put_execution_record(
+        dynamodb_client=dynamodb_client,
+        job_run_id=job_run_id,
+        source_bucket=source_bucket,
+        source_key=source_key,
+        partition_dt=partition_dt,
+    )
+
+    print('Tracked Glue execution for async completion handling: ' + job_run_id)
 
 
 def handler(event, _context):

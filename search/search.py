@@ -30,8 +30,7 @@ def _sql_string(value):
 
 
 def _sql_like_string(value):
-    # Use '#' as LIKE escape character to avoid Athena backslash escape parsing issues.
-    return _sql_string(value).replace('#', '##').replace('%', '#%').replace('_', '#_')
+    return _sql_string(value)
 
 
 def _build_short_sld_where_clause(terms):
@@ -55,7 +54,7 @@ def _build_long_sld_where_clause(terms):
         if not normalized:
             continue
         contains_pattern = _sql_like_string('%' + normalized + '%')
-        clauses.append("lower(dns) LIKE '" + contains_pattern + "' ESCAPE '#'")
+        clauses.append("lower(dns) LIKE '" + contains_pattern + "'")
 
     if not clauses:
         return ''
@@ -170,13 +169,38 @@ def _query_single_run_item(run_table_name, state_region):
     }
 
 
-def _delete_run_item(run_table_name, state_region, run_item):
+def _put_execution_record(
+    execution_table_name,
+    state_region,
+    query_execution_id,
+    run_table_name,
+    run_item,
+    output_bucket,
+    output_prefix,
+    normalized_item,
+    search_mode,
+):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ttl_epoch = int(now.timestamp()) + (86400 * 7)
     dynamodb = _get_dynamodb_client(state_region)
-    dynamodb.delete_item(
-        TableName=run_table_name,
-        Key={
-            'pk': {'S': run_item['pk']},
-            'sk': {'S': run_item['sk']}
+
+    dynamodb.put_item(
+        TableName=execution_table_name,
+        Item={
+            'pk': {'S': 'EXEC#' + query_execution_id},
+            'sk': {'S': 'ATHENA'},
+            'execution_type': {'S': 'ATHENA'},
+            'status': {'S': 'PENDING'},
+            'created_at': {'S': now.isoformat()},
+            'ttl': {'N': str(ttl_epoch)},
+            'item': {'S': normalized_item},
+            'search_mode': {'S': search_mode},
+            'run_table_name': {'S': run_table_name},
+            'run_table_region': {'S': state_region},
+            'run_pk': {'S': run_item['pk']},
+            'run_sk': {'S': run_item['sk']},
+            'output_bucket': {'S': output_bucket},
+            'output_prefix': {'S': output_prefix},
         }
     )
 
@@ -263,6 +287,13 @@ def handler(_event, _context):
             'body': json.dumps({'message': 'Missing RUN_DYNAMODB_TABLE environment variable'})
         }
 
+    execution_table_name = os.environ.get('EXECUTION_TABLE', '').strip()
+    if not execution_table_name:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': 'Missing EXECUTION_TABLE environment variable'})
+        }
+
     run_item = _query_single_run_item(run_table_name, state_region)
     if not run_item:
         return {
@@ -345,8 +376,17 @@ def handler(_event, _context):
     query_execution_id = response['QueryExecutionId']
     print('QueryExecutionId: ' + query_execution_id)
 
-    _delete_run_item(run_table_name, state_region, run_item)
-    print('Deleted run item after Athena launch: ' + run_item['sk'])
+    _put_execution_record(
+        execution_table_name=execution_table_name,
+        state_region=state_region,
+        query_execution_id=query_execution_id,
+        run_table_name=run_table_name,
+        run_item=run_item,
+        output_bucket=output_bucket,
+        output_prefix=output_prefix,
+        normalized_item=normalized_item,
+        search_mode=search_mode,
+    )
 
     return {
         'statusCode': 200,
@@ -357,7 +397,8 @@ def handler(_event, _context):
                 'terms': terms,
                 'searchMode': search_mode,
                 'queryExecutionId': query_execution_id,
-                'output': 's3://' + output_bucket + '/' + output_prefix
+                'output': 's3://' + output_bucket + '/' + output_prefix,
+                'executionTracking': 'stored'
             }
         )
     }

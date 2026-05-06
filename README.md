@@ -10,8 +10,9 @@
 | `WebdbStorage` | S3 buckets, Glue Iceberg table, console-ready optimizer IAM role, and Athena workgroup/query resources |
 | `WebdbTransfer` | Scheduled Lambda that copies source data into the enrich bucket |
 | `WebdbEnrich` | Event-driven Lambda that enriches domain records with GeoIP data |
-| `WebdbInsert` | S3/SQS-triggered Python Lambda that starts a Glue Spark job to append into Iceberg, then archives gzip JSONL |
-| `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations from shared DynamoDB and runs Athena UNLOAD of unique domain matches |
+| `WebdbInsert` | S3/SQS-triggered Python Lambda that starts Glue ingest asynchronously and records execution state for monitor handling |
+| `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations and launches Athena UNLOAD asynchronously |
+| `WebdbMonitor` | EventBridge-driven Lambda that tracks Athena/Glue completion, performs post-success actions, and sends SNS failure alerts |
 | `WebdbSchedule` | EventBridge-scheduled Lambda that scans cross-account permutation SLDs and seeds missing `LUNKER#` entries into `state` and `run` |
 | `WebdbOutput` | S3/SQS-triggered Lambda that ingests gzip output files and batch-writes discovered domains into DynamoDB |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
@@ -57,6 +58,8 @@ The Glue ingest job enforces Iceberg partition fields on these columns.
 | `pk` | `<bucket>#<key>` composite key |
 | `processed_at` | Unix timestamp of processing |
 | `ttl` | Auto-expiration (30 days) |
+
+`WebdbMonitor` creates the `webdb-<region>-executions` DynamoDB table to track asynchronous Athena and Glue execution status (`PENDING`, `SUCCEEDED`, `FAILED`) with context and 7-day TTL auto-cleanup.
 
 `WebdbOutput` writes items with this layout:
 
@@ -132,14 +135,15 @@ Use the ARN when the console/API asks for Role ARN. Use the role name when the U
 
 ## Insert Pipeline Behavior
 
-`WebdbInsert` ingests `.jsonl` objects from the insert bucket with built-in idempotency and resilience:
+`WebdbInsert` ingests `.jsonl` objects from the insert bucket with built-in idempotency and asynchronous completion handling:
 
 1. **Idempotency check** — Queries `processed-objects` DynamoDB table to skip already-processed files (prevents duplicate rows on SQS redelivery or manual reruns).
-2. **Glue ingest** — Starts a Glue Spark job that normalizes JSONL rows and appends them into the `webdb.domains` Iceberg table.
+2. **Glue ingest launch** — Starts a Glue Spark job (up to 60-minute timeout) that normalizes JSONL rows and appends them into the `webdb.domains` Iceberg table.
    - **First-run resilience** — If the table does not exist, the Glue job creates it with Iceberg v2 formatting and year/month/day partitioning, then inserts the batch.
    - **Partition field enforcement** — On subsequent runs, adds partition fields if missing (idempotent via exception handling).
-3. **Archive & cleanup** — After Glue succeeds, writes the original payload as gzip JSONL to the archive bucket and deletes the source object.
-4. **Idempotency record** — Records the file as processed in DynamoDB with a 30-day TTL for cleanup.
+3. **Execution tracking** — Stores Glue `JobRunId` plus source bucket/key and partition date in `webdb-<region>-executions` with `PENDING` status and 7-day TTL. Lambda returns immediately; the original `.jsonl` stays in the insert bucket until Glue completes.
+4. **Async archive on success** — `WebdbMonitor` receives the Glue `SUCCEEDED` EventBridge event, re-reads the `.jsonl` from the insert bucket, gzip-compresses it into the archive bucket under `year=YYYY/month=MM/day=DD/<filename>.gz`, deletes the source from the insert bucket, and marks the processed-objects record.
+5. **Failure alerting** — On terminal failure states (`FAILED`, `STOPPED`, `TIMEOUT`, `ERROR`, `EXPIRED`), `WebdbMonitor` marks status `FAILED` and emails `hello@lukach.io` via SNS. The original `.jsonl` is left in the insert bucket for inspection and retry.
 
 Partition date resolution order:
 
@@ -187,12 +191,29 @@ Query behavior:
 2. For SLDs shorter than 5 characters, uses the SLD plus all permutations and matches on the Athena `sld` column with `lower(sld) IN (...)`.
 3. For SLDs with length 5 or greater, matches only the SLD against Athena `dns` with contains syntax `lower(dns) LIKE '%<sld>%'`.
 4. Runs Athena `UNLOAD` of distinct `dns` values.
-5. After Athena launch succeeds, deletes the processed SLD entry from `run`.
+5. Stores query execution context in `webdb-<region>-executions` and returns immediately.
 
 Output behavior:
 
 1. Writes compressed text output to the output bucket.
 2. Prefix format is timestamped to avoid target directory collisions: `<sld>/YYYY-MM-DD-HH-MM-SS/`.
+3. `WebdbMonitor` handles Athena completion events: deletes the processed `run` item on `SUCCEEDED`, writes `000-empty.gz` when a successful query has zero rows, and sends SNS alerts on failure states.
+
+## Monitor Pipeline Behavior
+
+`WebdbMonitor` is invoked by EventBridge state-change rules for both Athena and Glue.
+
+Athena behavior (`SUCCEEDED`, `FAILED`, `CANCELLED` for workgroup `webdb`):
+
+1. Looks up the execution record by `queryExecutionId` in `webdb-<region>-executions`.
+2. On `SUCCEEDED`: writes a `000-empty.gz` marker to the output prefix if Athena produced zero result files, then deletes the processed SLD entry from the `run` table.
+3. On `FAILED` or `CANCELLED`: marks the record `FAILED` and emails `hello@lukach.io` via SNS with the query ID, state, and reason.
+
+Glue behavior (`SUCCEEDED`, `FAILED`, `STOPPED`, `TIMEOUT`, `ERROR`, `EXPIRED` for job `webdb-<region>-insert-iceberg`):
+
+1. Looks up the execution record by `jobRunId` in `webdb-<region>-executions`.
+2. On `SUCCEEDED`: reads the source object from the insert bucket, gzip-archives it to the archive bucket under `year=YYYY/month=MM/day=DD/<filename>.gz`, deletes the source, and marks the `processed-objects` record.
+3. On any failure state: marks the record `FAILED` and emails `hello@lukach.io` via SNS with the job name, run ID, state, and message.
 
 ## Schedule Pipeline Behavior
 
@@ -238,16 +259,17 @@ Current stack runtime sizing:
 | `transfer` | `512 MB` | `1 GiB` | Downloads/uploads one CSV object via `/tmp` |
 | `unzip` | `2048 MB` | `1 GiB` | Reads gzip fully in memory, then decompresses fully in memory |
 | `enrich` | `2048 MB` | `1 GiB` | Reads source file into `/tmp`, writes JSONL output, GeoIP lookups |
-| `insert` | `4096 MB` | `2 GiB` | Reads JSONL into memory, starts/polls Glue, archives gzip |
-| `search` | `512 MB` | `512 MiB` | Mostly orchestration (DynamoDB + Athena UNLOAD) |
+| `insert` | `2048 MB` | `1 GiB` | Reads JSONL into memory, starts Glue, records execution ID — returns immediately |
+| `search` | `512 MB` | `1 GiB` | Builds query, starts Athena UNLOAD, records execution ID — returns immediately |
+| `monitor` | `1024 MB` | `1 GiB` | Handles Athena/Glue completion events: archives source, writes empty markers, sends alerts |
 | `output` | `2048 MB` | `1 GiB` | Downloads gzip to `/tmp`, decompresses and batch-writes to DynamoDB |
 
 Recommended right-size baseline (no timeout changes):
 
-1. Keep `enrich`, `output`, and `search` as-is unless CloudWatch metrics show sustained low utilization.
+1. Keep `enrich`, `output`, `search`, and `monitor` as-is unless CloudWatch metrics show sustained low utilization.
 2. Reduce `transfer` ephemeral storage from `1 GiB` to `512 MiB` if source CSV files fit comfortably.
-3. Reduce `insert` ephemeral storage from `2 GiB` to `512 MiB` because the current handler is memory-driven rather than `/tmp`-driven.
-4. Treat `unzip` memory as the primary risk knob (it currently holds both compressed and decompressed payloads in memory at once). If large files are common, increase memory before increasing ephemeral storage.
+3. Treat `unzip` memory as the primary risk knob (it currently holds both compressed and decompressed payloads in memory at once). If large files are common, increase memory before increasing ephemeral storage.
+4. `insert` and `search` no longer hold large payloads in memory beyond job startup — memory and storage are sized for overhead only.
 
 Validation metrics to watch after any sizing change:
 
@@ -261,6 +283,9 @@ Validation metrics to watch after any sizing change:
 - [app.py](app.py) — CDK app entry point
 - [webdb/](webdb/) — CDK stack definitions
 - [enrich/](enrich/) — enrichment Lambda handler
-- [insert/](insert/) — Python Lambda handler and Glue Spark ingest job for Iceberg appends
+- [insert/](insert/) — Lambda that launches Glue ingest and Glue Spark job script for Iceberg appends
+- [monitor/](monitor/) — Lambda that handles Athena/Glue completion events and SNS failure alerts
 - [output/](output/) — Lambda for gzip output ingestion into DynamoDB
+- [search/](search/) — Lambda that launches Athena UNLOAD searches
 - [transfer/](transfer/) — transfer Lambda handler
+- [unzip/](unzip/) — Lambda that decompresses source archives
