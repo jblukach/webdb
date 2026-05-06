@@ -152,6 +152,8 @@ class WebdbInsert(Stack):
                 'GLUE_JOB_NAME': glue_job.name,
                 'GLUE_TIMEOUT_SECONDS': '840',
                 'GLUE_POLL_SECONDS': '10',
+                'GLUE_START_TIMEOUT_SECONDS': '30',
+                'GLUE_START_BACKOFF_SECONDS': '15',
                 'PROCESSED_OBJECTS_TABLE': processed_objects_table.table_name
             }
         )
@@ -189,6 +191,7 @@ class WebdbInsert(Stack):
         insert.add_event_source(
             _event_sources.SqsEventSource(
                 insert_queue,
-                batch_size = 10
+                batch_size = 1,
+                max_concurrency = 4
             )
         )

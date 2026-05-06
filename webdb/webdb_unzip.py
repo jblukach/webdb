@@ -96,6 +96,7 @@ class WebdbUnzip(Stack):
         )
 
         unzip_bucket.grant_read(unzip)
+        unzip_bucket.grant_delete(unzip)
         insert_bucket.grant_put(unzip)
         unzip.add_event_source(
             _event_sources.SqsEventSource(
