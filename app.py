@@ -8,6 +8,7 @@ from webdb.webdb_enrich import WebdbEnrich
 from webdb.webdb_github import WebdbGithub
 from webdb.webdb_insert import WebdbInsert
 from webdb.webdb_output import WebdbOutput
+from webdb.webdb_schedule import WebdbSchedule
 from webdb.webdb_search import WebdbSearch
 from webdb.webdb_storage import WebdbStorage
 from webdb.webdb_transfer import WebdbTransfer
@@ -94,6 +95,17 @@ WebdbUnzip(
 
 WebdbSearch(
     app, 'WebdbSearch',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbSchedule(
+    app, 'WebdbSchedule',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'

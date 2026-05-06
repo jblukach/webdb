@@ -12,7 +12,6 @@ _ATHENA = boto3.client('athena')
 _DYNAMODB_CLIENTS = {}
 _DESERIALIZER = TypeDeserializer()
 _STATE_PK = 'LUNKER#'
-_STATE_TTL_DAYS = 36
 
 
 def _get_dynamodb_client(region_name):
@@ -35,16 +34,33 @@ def _sql_like_string(value):
     return _sql_string(value).replace('#', '##').replace('%', '#%').replace('_', '#_')
 
 
-def _build_where_clause(terms, exact_sld_match=False):
-    if exact_sld_match:
-        return 'lower(sld) IN (' + ', '.join("'" + _sql_string(term) + "'" for term in terms) + ')'
-
-    like_clauses = []
+def _build_short_sld_where_clause(terms):
+    normalized_terms = []
     for term in terms:
-        like_term = _sql_like_string(term)
-        like_clauses.append("lower(dns) LIKE '%" + like_term + "%' ESCAPE '#'")
+        normalized = (term or '').strip().lower()
+        if normalized and normalized not in normalized_terms:
+            normalized_terms.append(normalized)
 
-    return ' OR '.join(like_clauses)
+    if not normalized_terms:
+        return ''
+
+    in_values = ', '.join("'" + _sql_string(term) + "'" for term in normalized_terms)
+    return 'lower(sld) IN (' + in_values + ')'
+
+
+def _build_long_sld_where_clause(terms):
+    clauses = []
+    for term in terms:
+        normalized = (term or '').strip().lower()
+        if not normalized:
+            continue
+        contains_pattern = _sql_like_string('%' + normalized + '%')
+        clauses.append("lower(dns) LIKE '" + contains_pattern + "' ESCAPE '#'")
+
+    if not clauses:
+        return ''
+
+    return ' OR '.join(clauses)
 
 
 def _build_search_terms(item, permutations):
@@ -56,6 +72,17 @@ def _build_search_terms(item, permutations):
             terms.append(normalized)
 
     return terms
+
+
+def _extract_sld_from_sk(sk_value):
+    if not sk_value:
+        return ''
+
+    match = re.match(r'^LUNKER#([^#]+)#', sk_value)
+    if not match:
+        return ''
+
+    return (match.group(1) or '').strip().lower()
 
 
 def _extract_permutations_from_attr(perm_attr):
@@ -104,6 +131,56 @@ def _build_table_identifiers(perm_table_env):
     return unique_identifiers
 
 
+def _query_single_run_item(run_table_name, state_region):
+    dynamodb = _get_dynamodb_client(state_region)
+    response = dynamodb.query(
+        TableName=run_table_name,
+        KeyConditionExpression='#pk = :pk',
+        ExpressionAttributeNames={
+            '#pk': 'pk',
+            '#sk': 'sk',
+            '#sld': 'sld'
+        },
+        ExpressionAttributeValues={
+            ':pk': {'S': _STATE_PK}
+        },
+        ProjectionExpression='#sk, #sld',
+        Limit=1
+    )
+
+    items = response.get('Items', [])
+    if not items:
+        return None
+
+    entry = items[0]
+    sk_value = (entry.get('sk') or {}).get('S', '')
+    sld_value = (entry.get('sld') or {}).get('S', '')
+
+    normalized_sld = (sld_value or '').strip().lower()
+    if not normalized_sld:
+        normalized_sld = _extract_sld_from_sk(sk_value)
+
+    if not normalized_sld or not sk_value:
+        return None
+
+    return {
+        'pk': _STATE_PK,
+        'sk': sk_value,
+        'sld': normalized_sld
+    }
+
+
+def _delete_run_item(run_table_name, state_region, run_item):
+    dynamodb = _get_dynamodb_client(state_region)
+    dynamodb.delete_item(
+        TableName=run_table_name,
+        Key={
+            'pk': {'S': run_item['pk']},
+            'sk': {'S': run_item['sk']}
+        }
+    )
+
+
 def _get_permutations(perm_table_env, normalized_item, region_candidates):
     table_identifiers = _build_table_identifiers(perm_table_env)
 
@@ -120,18 +197,25 @@ def _get_permutations(perm_table_env, normalized_item, region_candidates):
         for table_identifier in table_identifiers:
             try:
                 print('Querying DynamoDB - region=' + perm_region + ' table=' + table_identifier)
-                response = dynamodb.get_item(
+                response = dynamodb.query(
                     TableName=table_identifier,
-                    Key={
-                        'pk': {'S': 'LUNKER#'},
-                        'sk': {'S': 'LUNKER#' + normalized_item + '#'}
+                    KeyConditionExpression='#pk = :pk AND #sk = :sk',
+                    ExpressionAttributeNames={
+                        '#pk': 'pk',
+                        '#sk': 'sk',
+                        '#perm': 'perm'
                     },
-                    ProjectionExpression='perm'
+                    ExpressionAttributeValues={
+                        ':pk': {'S': 'LUNKER#'},
+                        ':sk': {'S': 'LUNKER#' + normalized_item + '#'}
+                    },
+                    ProjectionExpression='#perm',
+                    Limit=1
                 )
             except ClientError as e:
                 code = e.response.get('Error', {}).get('Code')
                 print(
-                    'DynamoDB get_item failed: region=' + perm_region
+                    'DynamoDB query failed: region=' + perm_region
                     + ' table=' + table_identifier
                     + ' code=' + str(code)
                 )
@@ -139,7 +223,8 @@ def _get_permutations(perm_table_env, normalized_item, region_candidates):
                     continue
                 raise
 
-            item = response.get('Item', {})
+            items = response.get('Items', [])
+            item = items[0] if items else {}
             if not item:
                 print('DynamoDB item not found: region=' + perm_region + ' table=' + table_identifier)
                 continue
@@ -159,64 +244,35 @@ def _get_permutations(perm_table_env, normalized_item, region_candidates):
     return []
 
 
-def _build_state_sk(normalized_item):
-    return 'LUNKER#' + normalized_item + '#'
-
-
-def _get_state_record(state_table_name, normalized_item, state_region):
-    dynamodb = _get_dynamodb_client(state_region)
-    response = dynamodb.get_item(
-        TableName=state_table_name,
-        Key={
-            'pk': {'S': _STATE_PK},
-            'sk': {'S': _build_state_sk(normalized_item)}
-        }
-    )
-    return response.get('Item', {})
-
-
-def _put_state_record(state_table_name, normalized_item, state_region, now_utc):
-    ttl_value = int((now_utc + datetime.timedelta(days=_STATE_TTL_DAYS)).timestamp())
-    dynamodb = _get_dynamodb_client(state_region)
-    dynamodb.put_item(
-        TableName=state_table_name,
-        Item={
-            'pk': {'S': _STATE_PK},
-            'sk': {'S': _build_state_sk(normalized_item)},
-            'lastday': {'S': now_utc.strftime('%Y-%m-%d')},
-            'ttl': {'N': str(ttl_value)}
-        }
-    )
-
-
-def _is_monthly_full_search_time(now_utc):
-    return now_utc.day == 1 and now_utc.hour == 2
-
-
-def handler(event, _context):
-    print(event)
-
-    item = event.get('Item')
-    if not item:
-        return {
-            'statusCode': 400,
-            'body': json.dumps({'message': 'Missing Item in payload'})
-        }
+def handler(_event, _context):
+    _ = _event
+    _ = _context
 
     region_candidates = []
     perm_table_env = os.environ.get('DYNAMODB_TABLE', '').strip()
-    state_table_name = os.environ.get('STATE_DYNAMODB_TABLE', '').strip()
+    run_table_name = os.environ.get('RUN_DYNAMODB_TABLE', '').strip()
     state_region = os.environ.get('STATE_DYNAMODB_REGION', 'us-east-2').strip() or 'us-east-2'
     if not perm_table_env:
         return {
             'statusCode': 500,
             'body': json.dumps({'message': 'Missing DYNAMODB_TABLE environment variable'})
         }
-    if not state_table_name:
+    if not run_table_name:
         return {
             'statusCode': 500,
-            'body': json.dumps({'message': 'Missing STATE_DYNAMODB_TABLE environment variable'})
+            'body': json.dumps({'message': 'Missing RUN_DYNAMODB_TABLE environment variable'})
         }
+
+    run_item = _query_single_run_item(run_table_name, state_region)
+    if not run_item:
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'No pending SLD entries in run table'})
+        }
+
+    normalized_item = run_item['sld']
+    item = normalized_item
+    print('Searching SLD from run table: ' + normalized_item)
 
     if perm_table_env.startswith('arn:'):
         arn_parts = perm_table_env.split(':')
@@ -227,25 +283,29 @@ def handler(event, _context):
         if region_name and region_name not in region_candidates:
             region_candidates.append(region_name)
 
-    normalized_item = item.strip().lower()
-    print('Searching SLD: ' + normalized_item)
-
     permutations = _get_permutations(perm_table_env, normalized_item, region_candidates)
     print('Permutations retrieved: ' + str(len(permutations)))
 
-    terms = _build_search_terms(item, permutations)
-    print('Search terms total: ' + str(len(terms)) + ' (sld+permutations)')
+    short_sld_mode = len(normalized_item) < 5
 
-    if not terms:
+    terms = _build_search_terms(item, permutations)
+    where_clause = ''
+
+    if short_sld_mode:
+        where_clause = _build_short_sld_where_clause(terms)
+    else:
+        where_clause = _build_long_sld_where_clause(terms)
+
+    print('Search terms total: ' + str(len(terms)))
+
+    if not where_clause:
         return {
             'statusCode': 200,
-            'body': json.dumps({'message': 'No search terms'})
+            'body': json.dumps({'message': 'No WHERE clause generated from terms'})
         }
 
-    exact_sld_match = len(normalized_item) < 5
-    where_clause = _build_where_clause(terms, exact_sld_match=exact_sld_match)
     print('WHERE clause terms: ' + str(len(terms)))
-    print('WHERE clause mode: ' + ('lower(sld) exact match' if exact_sld_match else 'lower(dns) LIKE'))
+    print('WHERE clause mode: ' + ('lower(sld) IN (...)' if short_sld_mode else 'lower(dns) LIKE %sld%'))
 
     now = datetime.datetime.now(datetime.timezone.utc)
     date_stem = now.strftime('%Y-%m-%d-%H-%M-%S')
@@ -257,22 +317,7 @@ def handler(event, _context):
     output_bucket = os.environ['OUTPUT_BUCKET']
     temp_bucket = os.environ['TEMP_BUCKET']
 
-    state_item = _get_state_record(state_table_name, normalized_item, state_region)
-    has_state_entry = bool(state_item)
-    is_monthly_full = _is_monthly_full_search_time(now)
-
-    partition_clause = ''
-    if has_state_entry and not is_monthly_full:
-        partition_clause = (
-            'year = ' + str(now.year)
-            + ' AND month = ' + str(now.month)
-            + ' AND day = ' + str(now.day)
-        )
-
-    if partition_clause:
-        where_clause = '(' + where_clause + ') AND ' + partition_clause
-
-    search_mode = 'full' if not partition_clause else 'daily-current-day'
+    search_mode = 'sld-exact-with-permutations' if short_sld_mode else 'dns-contains-sld'
     print('Search mode: ' + search_mode)
 
     query = (
@@ -300,14 +345,15 @@ def handler(event, _context):
     query_execution_id = response['QueryExecutionId']
     print('QueryExecutionId: ' + query_execution_id)
 
-    _put_state_record(state_table_name, normalized_item, state_region, now)
+    _delete_run_item(run_table_name, state_region, run_item)
+    print('Deleted run item after Athena launch: ' + run_item['sk'])
 
     return {
         'statusCode': 200,
         'body': json.dumps(
             {
                 'message': 'Athena search started',
-                'item': item,
+                'item': normalized_item,
                 'terms': terms,
                 'searchMode': search_mode,
                 'queryExecutionId': query_execution_id,

@@ -3,6 +3,8 @@ from aws_cdk import (
     RemovalPolicy,
     Size,
     Stack,
+    aws_events as _events,
+    aws_events_targets as _targets,
     aws_iam as _iam,
     aws_lambda as _lambda,
     aws_logs as _logs,
@@ -54,8 +56,8 @@ class WebdbSearch(Stack):
                     'glue:GetPartition',
                     'glue:GetPartitions',
                     'glue:BatchGetPartition',
-                    'dynamodb:GetItem',
-                    'dynamodb:PutItem',
+                    'dynamodb:Query',
+                    'dynamodb:DeleteItem',
                     'dynamodb:DescribeTable',
                     's3:GetBucketLocation',
                     's3:GetObject',
@@ -78,7 +80,7 @@ class WebdbSearch(Stack):
             handler = 'search.handler',
             environment = dict(
                 DYNAMODB_TABLE = 'arn:aws:dynamodb:'+region+':'+lunker.string_value+':table/permutation',
-                STATE_DYNAMODB_TABLE = 'state',
+                RUN_DYNAMODB_TABLE = 'run',
                 STATE_DYNAMODB_REGION = 'us-east-2',
                 ATHENA_DATABASE = 'webdb',
                 ATHENA_TABLE = 'domains',
@@ -104,3 +106,18 @@ class WebdbSearch(Stack):
             retention = _logs.RetentionDays.ONE_WEEK,
             removal_policy = RemovalPolicy.DESTROY
         )
+
+        event = _events.Rule(
+            self, 'event',
+            schedule = _events.Schedule.cron(
+                minute = '*/5',
+                hour = '*',
+                month = '*',
+                week_day = '*',
+                year = '*'
+            )
+        )
+
+        #event.add_target(
+        #    _targets.LambdaFunction(search)
+        #)

@@ -12,6 +12,7 @@
 | `WebdbEnrich` | Event-driven Lambda that enriches domain records with GeoIP data |
 | `WebdbInsert` | S3/SQS-triggered Python Lambda that starts a Glue Spark job to append into Iceberg, then archives gzip JSONL |
 | `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations from shared DynamoDB and runs Athena UNLOAD of unique domain matches |
+| `WebdbSchedule` | EventBridge-scheduled Lambda that scans cross-account permutation SLDs and seeds missing `LUNKER#` entries into `state` and `run` |
 | `WebdbOutput` | S3/SQS-triggered Lambda that ingests gzip output files and batch-writes discovered domains into DynamoDB |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
 
@@ -170,26 +171,43 @@ This produces files such as `2026-05-01-domains-detailed-aa`, `2026-05-01-domain
 
 ## Search Pipeline Behavior
 
-`WebdbSearch` is invoked by WebMonitor with a payload containing `Item` (the SLD).
+`WebdbSearch` is invoked to process one pending SLD from the local `run` table.
 
 Lookup behavior:
 
-1. Reads permutations from DynamoDB table `permutation` in the lunker account.
-2. Requires `DYNAMODB_TABLE` to be set (recommended: full table ARN for cross-account access).
-3. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>#`.
-4. Reads the `perm` attribute and normalizes/de-duplicates values.
+1. Queries one pending SLD from local DynamoDB table `run` using `pk = LUNKER#` and `Limit=1`.
+2. Uses that SLD to query permutations from DynamoDB table `permutation` in the lunker account.
+3. Requires `DYNAMODB_TABLE` to be set (recommended: full table ARN for cross-account access).
+4. Uses key pattern `pk = LUNKER#` and `sk = LUNKER#<sld>#`.
+5. Reads the `perm` attribute and normalizes/de-duplicates values.
 
 Query behavior:
 
 1. Builds a term list from the SLD plus all permutations.
-2. For SLDs shorter than 5 characters, queries Athena with `lower(sld) IN (...)` using the SLD plus all permutations.
-3. For longer SLDs, expands terms into Athena `LIKE` clauses joined by `OR`, using `lower(dns) LIKE '%term%' ESCAPE '#'`.
+2. For SLDs shorter than 5 characters, uses the SLD plus all permutations and matches on the Athena `sld` column with `lower(sld) IN (...)`.
+3. For SLDs with length 5 or greater, matches only the SLD against Athena `dns` with contains syntax `lower(dns) LIKE '%<sld>%'`.
 4. Runs Athena `UNLOAD` of distinct `dns` values.
+5. After Athena launch succeeds, deletes the processed SLD entry from `run`.
 
 Output behavior:
 
 1. Writes compressed text output to the output bucket.
 2. Prefix format is timestamped to avoid target directory collisions: `<sld>/YYYY-MM-DD-HH-MM-SS/`.
+
+## Schedule Pipeline Behavior
+
+`WebdbSchedule` runs every 5 minutes on EventBridge using a cron expression (`*/5 * * * ? *`) and backfills missing search seeds.
+
+Behavior:
+
+1. Queries the lunker-account `permutation` table (via cross-account table ARN) for unique SLD keys using `pk=LUNKER#` and `sk` pattern `LUNKER#<sld>#`.
+2. Checks which of those keys already exist in `state` using DynamoDB `BatchGetItem`.
+3. For missing SLDs only, writes matching records into both `state` and `run` with:
+   - `pk = LUNKER#`
+   - `sk = LUNKER#<sld>#`
+   - `lastday = yyyy-mm-dd` (UTC)
+   - `ttl = now + 365 days`
+4. Leaves existing state entries untouched.
 
 ## Output Pipeline Behavior
 

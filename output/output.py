@@ -8,7 +8,7 @@ import boto3
 
 
 DYNAMODB_TABLE = 'possibilities'
-TTL_DAYS = 36
+TTL_DAYS = 400
 
 
 def _parse_domain(domain):
