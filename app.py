@@ -4,6 +4,7 @@ import os
 import aws_cdk as cdk
 
 from webdb.webdb_database import WebdbDatabase
+from webdb.webdb_check import WebdbCheck
 from webdb.webdb_enrich import WebdbEnrich
 from webdb.webdb_github import WebdbGithub
 from webdb.webdb_insert import WebdbInsert
@@ -19,6 +20,17 @@ app = cdk.App()
 
 WebdbDatabase(
     app, 'WebdbDatabase',
+    env = cdk.Environment(
+        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region = 'us-east-2'
+    ),
+    synthesizer = cdk.DefaultStackSynthesizer(
+        qualifier = 'lukach'
+    )
+)
+
+WebdbCheck(
+    app, 'WebdbCheck',
     env = cdk.Environment(
         account = os.getenv('CDK_DEFAULT_ACCOUNT'),
         region = 'us-east-2'

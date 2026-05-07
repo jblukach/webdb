@@ -14,6 +14,7 @@
 | `WebdbSearch` | Lambda invoked by WebMonitor that expands permutations and launches Athena UNLOAD asynchronously |
 | `WebdbMonitor` | EventBridge-driven Lambda that tracks Athena/Glue completion, performs post-success actions, and sends SNS failure alerts |
 | `WebdbSchedule` | EventBridge-scheduled Lambda that scans cross-account permutation SLDs and seeds missing `LUNKER#` entries into `state` and `run` |
+| `WebdbCheck` | EventBridge-scheduled Lambda that processes exactly one eligible `state` SLD, counts permutation matches in `possibilities`, and writes totals to `metrics` |
 | `WebdbOutput` | S3/SQS-triggered Lambda that ingests gzip output files and batch-writes discovered domains into DynamoDB |
 | `WebdbGithub` | OIDC role for GitHub Actions deployments |
 
@@ -248,6 +249,33 @@ Current runtime configuration:
 - SQS batch size: `10`
 - DynamoDB batch write size: `25`
 
+## Check Pipeline Behavior
+
+`WebdbCheck` runs every 5 minutes on EventBridge and processes exactly one eligible SLD per invocation.
+
+Eligibility and processing flow (query/get only, no scans):
+
+1. Queries `state` with `pk = LUNKER#` and iterates `sk = LUNKER#<sld>#` candidates.
+2. Skips rows if `run` already has `pk = LUNKER#`, `sk = LUNKER#<sld>#`.
+3. Reads `check` for the same key (`pk = LUNKER#`, `sk = LUNKER#<sld>#`).
+4. If the `check` row exists and its `lastday` hour is at least `02` UTC (`yyyy-mm-dd-hh`), the SLD is skipped.
+5. If the `check` row does not exist, the SLD remains eligible.
+6. For the first SLD that passes all checks, performs a cross-account query to `permutation` with exact key `pk = LUNKER#`, `sk = LUNKER#<sld>#` and reads `perm`.
+7. Queries `possibilities` with `pk = LUNKER#` and `begins_with(sk, LUNKER#<sld>#)` to collect domains.
+8. Counts occurrences of each permutation across the returned domains.
+9. Writes one row per permutation to `metrics` with `pk = LUNKER#`, `sk = LUNKER#<sld>#<perm>#`, and numeric `total`.
+10. Writes a completion marker to `check` for `pk = LUNKER#`, `sk = LUNKER#<sld>#`.
+11. `check` and `metrics` writes use a 30-day TTL.
+
+### Example Eligibility
+
+For a candidate key `pk = LUNKER#`, `sk = LUNKER#apple#`:
+
+1. If `run` has the same key, it is skipped.
+2. If `run` does not have the key and `check` has no row for that key, it is eligible.
+3. If `run` does not have the key and `check.lastday` is `2026-05-07-01`, it is eligible (`HH = 01 < 02`).
+4. If `run` does not have the key and `check.lastday` is `2026-05-07-02` (or higher hour), it is skipped.
+
 ## Lambda Sizing Guidance
 
 All pipeline Lambdas are configured with a `900` second timeout by design to tolerate slow upstream/downstream dependencies (S3, Glue, Athena) without premature retries.
@@ -261,6 +289,7 @@ Current stack runtime sizing:
 | `enrich` | `2048 MB` | `1 GiB` | Reads source file into `/tmp`, writes JSONL output, GeoIP lookups |
 | `insert` | `2048 MB` | `1 GiB` | Reads JSONL into memory, starts Glue, records execution ID — returns immediately |
 | `search` | `512 MB` | `1 GiB` | Builds query, starts Athena UNLOAD, records execution ID — returns immediately |
+| `check` | `1024 MB` | `1 GiB` | Processes one eligible state SLD, counts permutation hits, writes metrics/check markers |
 | `monitor` | `1024 MB` | `1 GiB` | Handles Athena/Glue completion events: archives source, writes empty markers, sends alerts |
 | `output` | `2048 MB` | `1 GiB` | Downloads gzip to `/tmp`, decompresses and batch-writes to DynamoDB |
 
@@ -284,6 +313,7 @@ Validation metrics to watch after any sizing change:
 - [webdb/](webdb/) — CDK stack definitions
 - [enrich/](enrich/) — enrichment Lambda handler
 - [insert/](insert/) — Lambda that launches Glue ingest and Glue Spark job script for Iceberg appends
+- [check/](check/) — Lambda that selects one eligible SLD and writes permutation metrics
 - [monitor/](monitor/) — Lambda that handles Athena/Glue completion events and SNS failure alerts
 - [output/](output/) — Lambda for gzip output ingestion into DynamoDB
 - [search/](search/) — Lambda that launches Athena UNLOAD searches

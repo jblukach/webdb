@@ -26,7 +26,7 @@ class WebdbDatabase(Stack):
             parameter_name = '/account/webmonitor'
         )
 
-        def replica_resource_policy(region: str) -> _iam.PolicyDocument:
+        def replica_resource_policy(region: str, table_name: str) -> _iam.PolicyDocument:
             return _iam.PolicyDocument(
                 statements = [
                     _iam.PolicyStatement(
@@ -46,13 +46,13 @@ class WebdbDatabase(Stack):
                                 service = 'dynamodb',
                                 region = region,
                                 resource = 'table',
-                                resource_name = 'possibilities',
+                                resource_name = table_name,
                             ),
                             self.format_arn(
                                 service = 'dynamodb',
                                 region = region,
                                 resource = 'table',
-                                resource_name = 'possibilities/index/*',
+                                resource_name = f'{table_name}/index/*',
                             ),
                         ],
                     ),
@@ -72,7 +72,7 @@ class WebdbDatabase(Stack):
                                 service = 'dynamodb',
                                 region = region,
                                 resource = 'table',
-                                resource_name = 'possibilities',
+                                resource_name = table_name,
                             ),
                         ],
                     ),
@@ -96,16 +96,47 @@ class WebdbDatabase(Stack):
                 point_in_time_recovery_enabled = True
             ),
             deletion_protection = True,
-            resource_policy = replica_resource_policy(primary_region),
+            resource_policy = replica_resource_policy(primary_region, 'possibilities'),
             time_to_live_attribute = 'ttl',
             replicas = [
                 _dynamodb.ReplicaTableProps(
                     region = 'us-east-1',
-                    resource_policy = replica_resource_policy('us-east-1'),
+                    resource_policy = replica_resource_policy('us-east-1', 'possibilities'),
                 ),
                 _dynamodb.ReplicaTableProps(
                     region = 'us-west-2',
-                    resource_policy = replica_resource_policy('us-west-2'),
+                    resource_policy = replica_resource_policy('us-west-2', 'possibilities'),
+                ),
+            ],
+        )
+
+        _dynamodb.TableV2(
+            self, 'metrics',
+            table_name = 'metrics',
+            partition_key = {
+                'name': 'pk',
+                'type': _dynamodb.AttributeType.STRING
+            },
+            sort_key = {
+                'name': 'sk',
+                'type': _dynamodb.AttributeType.STRING
+            },
+            billing = _dynamodb.Billing.on_demand(),
+            removal_policy = RemovalPolicy.DESTROY,
+            point_in_time_recovery_specification = _dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled = True
+            ),
+            deletion_protection = True,
+            resource_policy = replica_resource_policy(primary_region, 'metrics'),
+            time_to_live_attribute = 'ttl',
+            replicas = [
+                _dynamodb.ReplicaTableProps(
+                    region = 'us-east-1',
+                    resource_policy = replica_resource_policy('us-east-1', 'metrics'),
+                ),
+                _dynamodb.ReplicaTableProps(
+                    region = 'us-west-2',
+                    resource_policy = replica_resource_policy('us-west-2', 'metrics'),
                 ),
             ],
         )
@@ -133,6 +164,26 @@ class WebdbDatabase(Stack):
         _dynamodb.TableV2(
             self, 'state',
             table_name = 'state',
+            partition_key = {
+                'name': 'pk',
+                'type': _dynamodb.AttributeType.STRING
+            },
+            sort_key = {
+                'name': 'sk',
+                'type': _dynamodb.AttributeType.STRING
+            },
+            billing = _dynamodb.Billing.on_demand(),
+            removal_policy = RemovalPolicy.DESTROY,
+            point_in_time_recovery_specification = _dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled = True
+            ),
+            deletion_protection = True,
+            time_to_live_attribute = 'ttl',
+        )
+
+        _dynamodb.TableV2(
+            self, 'check',
+            table_name = 'check',
             partition_key = {
                 'name': 'pk',
                 'type': _dynamodb.AttributeType.STRING
