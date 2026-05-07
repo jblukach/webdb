@@ -57,50 +57,6 @@ def _parse_lastday_utc(value):
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def _is_lastday_hour_eligible(lastday_value):
-    parsed = _parse_lastday_utc(lastday_value)
-    if parsed is None:
-        return False
-
-    return parsed.hour >= 2
-
-
-def _item_exists(table_name, region_name, pk_value, sk_value):
-    dynamodb = _get_dynamodb_client(region_name)
-    response = dynamodb.get_item(
-        TableName=table_name,
-        Key={
-            'pk': {'S': pk_value},
-            'sk': {'S': sk_value},
-        },
-        ProjectionExpression='pk',
-        ConsistentRead=True,
-    )
-    return bool(response.get('Item'))
-
-
-def _get_check_row(table_name, region_name, pk_value, sk_value):
-    dynamodb = _get_dynamodb_client(region_name)
-    response = dynamodb.get_item(
-        TableName=table_name,
-        Key={
-            'pk': {'S': pk_value},
-            'sk': {'S': sk_value},
-        },
-        ProjectionExpression='#lastday',
-        ExpressionAttributeNames={
-            '#lastday': 'lastday',
-        },
-        ConsistentRead=True,
-    )
-
-    item = response.get('Item') or {}
-    return {
-        'exists': bool(item),
-        'lastday': (item.get('lastday') or {}).get('S', '').strip(),
-    }
-
-
 def _extract_permutations_from_attr(perm_attr):
     if not perm_attr:
         return []
@@ -175,19 +131,99 @@ def _get_state_candidates(state_table_name, state_region):
         query_kwargs['ExclusiveStartKey'] = last_key
 
 
+def _get_processed_sk_set(table_name, region_name):
+    dynamodb = _get_dynamodb_client(region_name)
+    query_kwargs = {
+        'TableName': table_name,
+        'KeyConditionExpression': '#pk = :pk',
+        'ExpressionAttributeNames': {
+            '#pk': 'pk',
+            '#sk': 'sk',
+        },
+        'ExpressionAttributeValues': {
+            ':pk': {'S': _STATE_PK},
+        },
+        'ProjectionExpression': '#sk',
+    }
+
+    processed_sk = set()
+    while True:
+        response = dynamodb.query(**query_kwargs)
+        for item in response.get('Items', []):
+            sk_value = (item.get('sk') or {}).get('S', '').strip()
+            if sk_value:
+                processed_sk.add(sk_value)
+
+        last_key = response.get('LastEvaluatedKey')
+        if not last_key:
+            break
+
+        query_kwargs['ExclusiveStartKey'] = last_key
+
+    return processed_sk
+
+
+def _get_check_lastday_by_sk(check_table_name, region_name):
+    dynamodb = _get_dynamodb_client(region_name)
+    query_kwargs = {
+        'TableName': check_table_name,
+        'KeyConditionExpression': '#pk = :pk',
+        'ExpressionAttributeNames': {
+            '#pk': 'pk',
+            '#sk': 'sk',
+            '#lastday': 'lastday',
+        },
+        'ExpressionAttributeValues': {
+            ':pk': {'S': _STATE_PK},
+        },
+        'ProjectionExpression': '#sk, #lastday',
+    }
+
+    check_lastday_by_sk = {}
+    while True:
+        response = dynamodb.query(**query_kwargs)
+        for item in response.get('Items', []):
+            sk_value = (item.get('sk') or {}).get('S', '').strip()
+            if not sk_value:
+                continue
+
+            check_lastday_by_sk[sk_value] = (item.get('lastday') or {}).get('S', '').strip()
+
+        last_key = response.get('LastEvaluatedKey')
+        if not last_key:
+            break
+
+        query_kwargs['ExclusiveStartKey'] = last_key
+
+    return check_lastday_by_sk
+
+
+def _should_skip_checked_candidate(lastday_value, now_utc):
+    parsed = _parse_lastday_utc(lastday_value)
+    if parsed is None:
+        return True
+
+    # Same UTC day is never eligible to rerun.
+    if parsed.date() == now_utc.date():
+        return True
+
+    # Previous-day checks become eligible at/after 02:00 UTC.
+    return now_utc.hour < 2
+
+
 def _find_eligible_sld(state_table_name, run_table_name, check_table_name, state_region):
+    run_sk = _get_processed_sk_set(run_table_name, state_region)
+    check_lastday_by_sk = _get_check_lastday_by_sk(check_table_name, state_region)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
     for candidate in _get_state_candidates(state_table_name, state_region):
-        if _item_exists(run_table_name, state_region, candidate['pk'], candidate['sk']):
+        if candidate['sk'] in run_sk:
             continue
 
-        check_row = _get_check_row(
-            check_table_name,
-            state_region,
-            candidate['pk'],
-            candidate['sk'],
-        )
-
-        if check_row['exists'] and _is_lastday_hour_eligible(check_row['lastday']):
+        if candidate['sk'] in check_lastday_by_sk and _should_skip_checked_candidate(
+            check_lastday_by_sk[candidate['sk']],
+            now_utc,
+        ):
             continue
 
         return candidate
